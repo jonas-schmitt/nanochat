@@ -371,9 +371,16 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5, muon_orth="fused"):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
+        # muon_orth selects the Muon orthogonalization map U -> O (GNS experiments).
+        # "fused" = stock Polar-Express compiled kernel (production default). Any other
+        # value (a gns Schedule, or "polar_express"/"svd"/"none") routes the Muon groups
+        # through the eager pluggable path in optim.py. Only the single-GPU MuonAdamW
+        # supports the pluggable path; the distributed kernel keeps the fused map.
+        if muon_orth != "fused" and ddp:
+            raise NotImplementedError("muon_orth != 'fused' requires single-GPU MuonAdamW (the GNS experiments run single-GPU)")
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
@@ -405,6 +412,7 @@ class GPT(nn.Module):
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                orth=muon_orth,
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW

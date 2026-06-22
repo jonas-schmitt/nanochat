@@ -88,6 +88,28 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+def polar_express_orth(g: Tensor, ns_steps: int) -> Tensor:
+    """Stock nanochat Polar-Express orthogonalization map U -> O (no momentum, no
+    variance reduction, no parameter update). Extracted so the fused kernel and the
+    pluggable unfused path (muon_step_unfused) share one source of truth, and so GNS
+    schedule arms are compared against an identical harness that varies ONLY this map.
+    Operates on a stacked (..., m, n) tensor; returns the orthogonalized X. Cast to
+    bf16 for speed when available; skip otherwise (fp16 is unstable here due to limited
+    exponent range)."""
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    if g.size(-2) > g.size(-1): # Tall matrix
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else: # Wide matrix (original math)
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    return X
+
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
@@ -112,21 +134,8 @@ def muon_step_fused(
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
-    # Polar express
-    # Cast to bf16 for speed when available; skip cast otherwise (fp16 is unstable here due to limited exponent range)
-    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
-    if g.size(-2) > g.size(-1): # Tall matrix
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else: # Wide matrix (original math)
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
+    # Polar express orthogonalization (U -> O)
+    g = polar_express_orth(g, ns_steps)
 
     # Variance reduction
     beta2 = beta2_t.to(g.dtype)
@@ -146,6 +155,79 @@ def muon_step_fused(
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+# -----------------------------------------------------------------------------
+# Pluggable orthogonalization for experiments (GNS integration).
+#
+# The fused kernel above hardcodes Polar-Express orthogonalization. To compare
+# alternative orthogonalization maps U -> O (GNS-compiled precision-aware schedules,
+# an exact-SVD oracle, or a no-orthogonalization control) under an IDENTICAL harness
+# that varies only that map, we provide an eager (non-compiled) Muon step. Everything
+# except the U -> O map — Nesterov momentum, NorMuon variance reduction, cautious
+# weight decay + update — is byte-identical to muon_step_fused. This is the
+# fairness discipline reused from gns/experiments/exp7_downstream.py.
+#
+# Method may be:
+#   "polar_express" : the stock map (polar_express_orth) — used to validate that the
+#                     unfused harness reproduces the fused kernel (numerics sanity gate).
+#   "svd"           : exact polar factor U @ Vh (oracle upper bound, scale-invariant).
+#   "none"          : identity (SGD-momentum control, no orthogonalization).
+#   a gns Schedule  : tuple of gns.ir steps, executed per-matrix via gns.executor
+#                     (faithful simulated precision: storage-round + fp32 gemm).
+
+def orthogonalize_eager(g: Tensor, method, ns_steps: int) -> Tensor:
+    """Map a stacked (K, m, n) update tensor to its orthogonalized form (see above)."""
+    if method == "polar_express":
+        return polar_express_orth(g, ns_steps)
+    if method == "none":
+        return g
+    if method == "svd":
+        gf = g.float()
+        U, _, Vh = torch.linalg.svd(gf, full_matrices=False)
+        return U @ Vh
+    if isinstance(method, tuple):  # a gns Schedule (tuple of IR steps)
+        from gns.executor import run_schedule
+        gf = g.float()
+        outs = [run_schedule(gf[i], method).to(torch.float32) for i in range(gf.shape[0])]
+        return torch.stack(outs)
+    raise ValueError(f"unknown orthogonalize method {method!r}")
+
+def muon_step_unfused(
+    stacked_grads: Tensor,
+    stacked_params: Tensor,
+    momentum_buffer: Tensor,
+    second_momentum_buffer: Tensor,
+    momentum: float,
+    lr: float,              # already shape-scaled by the caller
+    wd: float,
+    beta2: float,
+    ns_steps: int,
+    red_dim: int,
+    orth_method,            # "polar_express" | "svd" | "none" | gns Schedule
+) -> None:
+    """Eager Muon step with a pluggable orthogonalization map. Identical to
+    muon_step_fused except the U -> O map is `orth_method` and nothing is compiled."""
+    # Nesterov momentum
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    # Pluggable orthogonalization (U -> O)
+    g = orthogonalize_eager(g, orth_method, ns_steps)
+
+    # Variance reduction (NorMuon) — identical to the fused kernel
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm = (v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size).sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+
+    # Cautious weight decay + parameter update — identical to the fused kernel
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_((lr * g + lr * wd * stacked_params * mask).to(stacked_params.dtype))
 
 # -----------------------------------------------------------------------------
 # Single GPU version of the MuonAdamW optimizer.
@@ -259,25 +341,45 @@ class MuonAdamW(torch.optim.Optimizer):
         stacked_grads = torch.stack([p.grad for p in params])
         stacked_params = torch.stack(params)
 
-        # Fill all the 0-D tensors with current values
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
-
-        # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
-        muon_step_fused(
-            stacked_grads,
-            stacked_params,
-            momentum_buffer,
-            second_momentum_buffer,
-            self._muon_momentum_t,
-            self._muon_lr_t,
-            self._muon_wd_t,
-            self._muon_beta2_t,
-            group["ns_steps"],
-            red_dim,
-        )
+        # Experiment routing: an arm may set group['orth'] to a non-default
+        # orthogonalization (gns Schedule | "svd" | "none" | "polar_express"); that
+        # path is eager and pluggable. The default (orth absent or "fused") keeps the
+        # production fused kernel. The shape-scaled lr is identical on both paths.
+        scaled_lr = group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5
+        orth = group.get("orth", None)
+        if orth is None or orth == "fused":
+            # Fill all the 0-D tensors with current values
+            self._muon_momentum_t.fill_(group["momentum"])
+            self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+            self._muon_lr_t.fill_(scaled_lr)
+            self._muon_wd_t.fill_(group["weight_decay"])
+            # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
+            muon_step_fused(
+                stacked_grads,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                self._muon_momentum_t,
+                self._muon_lr_t,
+                self._muon_wd_t,
+                self._muon_beta2_t,
+                group["ns_steps"],
+                red_dim,
+            )
+        else:
+            muon_step_unfused(
+                stacked_grads,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                group["momentum"],
+                scaled_lr,
+                group["weight_decay"],
+                group["beta2"] if group["beta2"] is not None else 0.0,
+                group["ns_steps"],
+                red_dim,
+                orth,
+            )
 
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
