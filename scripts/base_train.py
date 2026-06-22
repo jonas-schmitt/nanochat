@@ -64,6 +64,7 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--muon-schedule", type=str, default="fused", help="Muon orthogonalization arm (GNS experiments): 'fused' (stock Polar-Express kernel), 'polar_express', 'svd', 'none', or a GNS arm name (jordan5_bf16_control, all_fp8_control, frontier_cost_*). Non-'fused' routes through the eager pluggable path (single-GPU only).")
+parser.add_argument("--muon-fp8", type=str, default="real", choices=["real", "sim"], help="fp8 execution for gns schedule arms: 'real' (_scaled_mm, Round 2 wall-clock) or 'sim' (faithful simulated, Round 1 quality). Ignored for --muon-schedule=fused.")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
@@ -311,9 +312,14 @@ if weight_decay_scaled != args.weight_decay:
 if args.muon_schedule == "fused":
     muon_orth = "fused"
 else:
-    from nanochat.muon_schedules import get_orth_method
+    from nanochat.muon_schedules import get_orth_method, set_fp8_real
     muon_orth = get_orth_method(args.muon_schedule)
-    print0(f"Muon orthogonalization arm: {args.muon_schedule}")
+    # Round 2 (wall-clock) uses the real _scaled_mm fp8 kernel; Round 1 (quality) uses
+    # faithful simulated fp8. Default real here since the resolving model's matmul dims
+    # are multiples of 64 (divisible by 16, the _scaled_mm constraint).
+    use_real = (args.muon_fp8 == "real")
+    got_real = set_fp8_real(use_real)
+    print0(f"Muon orthogonalization arm: {args.muon_schedule} | fp8={'real' if got_real else 'simulated'} (requested {args.muon_fp8})")
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 optimizer = model.setup_optimizer(
