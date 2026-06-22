@@ -32,7 +32,7 @@ run () {  # arm lr fp8
     $PY -m scripts.base_train $MODEL --muon-schedule=$arm --muon-fp8=$fp8 --matrix-lr=$lr > "$log" 2>&1
   fi
   local rc=$? t1=$(date +%s)
-  local bpb=$(grep -oiE "val bpb[: ]+[0-9.]+" "$log" | tail -1 | grep -oE "[0-9.]+$")
+  local bpb=$(grep -oiE "bpb:?[[:space:]]+[0-9.]+" "$log" | tail -1 | grep -oE "[0-9.]+$")
   echo -e "${arm}\t${lr}\t${fp8}\t${bpb:-NA}\t$((t1-t0))\t$([ $rc -eq 0 ] && echo ok || echo fail)" >> "$TSV"
   echo "[$(date +%H:%M:%S)] <<< $tag  bpb=${bpb:-NA}  ${rc}  $((t1-t0))s"
 }
