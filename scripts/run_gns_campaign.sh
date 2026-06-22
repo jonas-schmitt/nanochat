@@ -17,7 +17,7 @@ TSV="$OUT/summary.tsv"
 
 # --- small resolving model: ~small enough for many runs, large enough to rank arms ---
 MODEL="--depth=8 --max-seq-len=1024 --window-pattern=L --device-batch-size=16 \
- --total-batch-size=131072 --num-iterations=600 --eval-every=100 --eval-tokens=262144 \
+ --total-batch-size=131072 --num-iterations=400 --eval-every=100 --eval-tokens=262144 \
  --core-metric-every=-1 --sample-every=-1 --warmup-steps=30 --run=dummy"
 
 run () {  # arm lr fp8
