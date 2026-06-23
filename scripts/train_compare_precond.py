@@ -42,6 +42,7 @@ import sys
 sys.path.insert(0, "/home/jonas/git/gns/src")
 from gns import coupled  # noqa: E402
 from gns.coupled import CoupledInit, CoupledStep  # noqa: E402
+from gns.fused import PolarStep, run_polar_2d  # noqa: E402
 from gns.precision import TORCH_DTYPE, Prec  # noqa: E402
 
 GNS_OUT = Path("/home/jonas/git/gns/results/precond_train_compare.json")
@@ -70,8 +71,21 @@ def parse_args():
     p.add_argument("--n-val-batches", type=int, default=16)
     p.add_argument("--eval-every", type=int, default=50)
     p.add_argument("--arms", type=str, default="muon,shampoo,ortho_shampoo,layer_adaptive,sgd")
+    p.add_argument("--polar-coeffs", type=str, default="",
+                   help="③ searched_polar arm: ';'-separated 'a,b,c' Gram-poly triples")
+    p.add_argument("--polar-precs", type=str, default="",
+                   help="③ per-step precision (comma list, e.g. fp8e4m3,bf16,...); default all bf16")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
+
+
+def build_polar_schedule(args):
+    if not args.polar_coeffs:
+        return None
+    triples = [tuple(float(x) for x in t.split(",")) for t in args.polar_coeffs.split(";")]
+    precs = (args.polar_precs.split(",") if args.polar_precs
+             else ["bf16"] * len(triples))
+    return tuple(PolarStep(coeffs=t, prec=Prec(p)) for t, p in zip(triples, precs))
 
 
 def build_model(args, vocab_size, device, seed):
@@ -171,6 +185,8 @@ def direction(arm, p, st, grad, args, step):
         return gm
     if arm == "muon":
         return polar_express_orth(gm, args.ns_steps)
+    if arm == "searched_polar":  # ③: a searched gns.fused polar schedule as the U->O map
+        return run_polar_2d(gm, args._polar_schedule).to(gm.dtype)
     if arm == "shampoo":
         return _shampoo_dir(gm, st) if use_precond else gm
     if arm == "ortho_shampoo":
@@ -259,6 +275,7 @@ def main():
     val_batches = materialise("val", args.n_val_batches)
     print(f"depth {args.depth}, vocab {vocab}, {len(train_batches)} train + {len(val_batches)} val batches")
 
+    args._polar_schedule = build_polar_schedule(args)
     arms = args.arms.split(",")
     lr_grid = [float(x) for x in args.matrix_lr_grid.split(",")]
     results = {"config": vars(args), "arms": {}}
