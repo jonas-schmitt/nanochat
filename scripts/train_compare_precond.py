@@ -1,27 +1,28 @@
-"""Real training comparison: does the gns COUPLED inverse-root production work as a Shampoo
-preconditioner inside an actual nanochat GPT training run?
+"""SOTA-hunt harness: fair matrix-preconditioner comparison inside a real nanochat GPT run.
 
-Controlled experiment. Same model init (seed), same pre-materialised climbmix batches, same AdamW
-for non-matrix params; the ONLY thing that varies is the MATRIX-parameter update DIRECTION:
+Every arm shares Muon's EXACT post-direction machinery — Nesterov momentum, NorMuon variance
+reduction, and cautious weight decay/update (lifted from nanochat.optim.muon_step_unfused) — and
+varies ONLY the matrix DIRECTION map D(g, state). So the `muon` arm is the real SOTA Muon (not bare
+polar + an RMS-norm hack), and every other arm is judged against it on equal footing.
 
-  muon    : O = polar_express_orth(momentum_grad)          (nanochat's Muon/polar baseline)
-  shampoo : P = L^(-1/4) @ momentum_grad @ R^(-1/4)         (Shampoo via gns.coupled, fp32)
-            with L=EMA(G Gᵀ), R=EMA(Gᵀ G); L^(-1/4) computed by the COUPLED Newton–Schulz
-            production (power-iteration λmax, relative ridge, no eigendecomposition).
-  sgd     : P = momentum_grad                               (no preconditioner — floor)
+Direction maps:
+  sgd            : D = nesterov(g)                                        (no-precond floor)
+  muon           : D = polar_express_orth(nesterov(g))                    (SOTA baseline)
+  shampoo        : D = L^(-1/4) @ nesterov(g) @ R^(-1/4)                  (Shampoo via gns.coupled)
+  ortho_shampoo  : D = polar_express_orth( L^(-1/4) g R^(-1/4) )          (① curvature dir + Muon robustness)
+  layer_adaptive : per-factor: ortho_shampoo if kappa_proxy > thresh else muon   (② allocation)
 
-Every matrix update is RMS-normalised to unit RMS before the (shared) matrix LR, so the LR is
-comparable across arms and we compare update DIRECTION quality, not scale.
-
-Decisive question: does shampoo-coupled train competitively with Muon (loss decreases, no
-divergence)? If yes, the coupled inverse-root production is validated end-to-end in the loop —
-the thing it was built for.
+L,R = EMA Kronecker factors (G Gᵀ, Gᵀ G); L^(-1/4) by the coupled Newton–Schulz production (gns.coupled,
+fp32, power-iteration λmax, relative ridge), recomputed every K steps. Non-matrix params: shared AdamW.
+Identical model init + pre-materialised climbmix batches across arms; per-arm matrix-LR sweep (fair
+tuning). Logs val loss vs BOTH step and wall-clock.
 
 Run (tct-models env + gns on path):
   cd /home/jonas/git/nanochat
   PYTHONPATH=/home/jonas/git/nanochat:/home/jonas/git/gns/src \
     uv run --project /home/jonas/git/tct-models python scripts/train_compare_precond.py \
-      --depth 6 --num-iterations 500
+      --depth 6 --num-iterations 2000 --arms muon,shampoo,ortho_shampoo,layer_adaptive,sgd \
+      --matrix-lr-grid 0.01,0.02,0.04
 """
 import argparse
 import json
@@ -53,19 +54,22 @@ def parse_args():
     p.add_argument("--head-dim", type=int, default=128)
     p.add_argument("--max-seq-len", type=int, default=1024)
     p.add_argument("--device-batch-size", type=int, default=16)
-    p.add_argument("--num-iterations", type=int, default=500)
-    p.add_argument("--matrix-lr", type=float, default=0.02)
+    p.add_argument("--num-iterations", type=int, default=2000)
+    p.add_argument("--matrix-lr-grid", type=str, default="0.02")
     p.add_argument("--adam-lr", type=float, default=3e-3)
     p.add_argument("--momentum", type=float, default=0.95)
+    p.add_argument("--beta2", type=float, default=0.95)          # NorMuon second-moment EMA
+    p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--ns-steps", type=int, default=5)
     p.add_argument("--warmup-steps", type=int, default=20)
     p.add_argument("--shampoo-beta", type=float, default=0.95)
     p.add_argument("--shampoo-ridge", type=float, default=1e-4)
     p.add_argument("--shampoo-coupled-steps", type=int, default=24)
     p.add_argument("--shampoo-recompute-every", type=int, default=10)
+    p.add_argument("--kappa-threshold", type=float, default=1e4)  # layer_adaptive routing
     p.add_argument("--n-val-batches", type=int, default=16)
     p.add_argument("--eval-every", type=int, default=50)
-    p.add_argument("--arms", type=str, default="muon,shampoo,sgd")
+    p.add_argument("--arms", type=str, default="muon,shampoo,ortho_shampoo,layer_adaptive,sgd")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -90,6 +94,7 @@ def matrix_params(model):
     return [p for p in model.transformer.h.parameters() if p.dim() == 2]
 
 
+# ----------------------------- coupled inverse 1/4-root -----------------------------
 def _power_iter_max(L, iters=18):
     n = L.shape[0]
     v = torch.randn(n, device=L.device, dtype=L.dtype)
@@ -100,8 +105,21 @@ def _power_iter_max(L, iters=18):
     return float(v @ (L @ v))
 
 
+def _kappa_proxy(L, lam_max=None):
+    """Cheap condition-number proxy: lam_max / lam_min via two power-iteration sequences
+    (the second on (lam_max I - L) gives lam_max - lam_min). Eigendecomposition-free."""
+    Ls = 0.5 * (L + L.t())
+    lam_max = _power_iter_max(Ls) if lam_max is None else lam_max
+    if not (lam_max > 0 and np.isfinite(lam_max)):
+        return 1.0
+    n = Ls.shape[0]
+    shifted = lam_max * torch.eye(n, device=Ls.device, dtype=Ls.dtype) - Ls
+    gap = _power_iter_max(shifted)           # ~ lam_max - lam_min
+    lam_min = max(lam_max - gap, 0.0)
+    return lam_max / max(lam_min, lam_max * 1e-12)
+
+
 def inv_fourth_root(L, ridge, k, prec=Prec.fp32):
-    """L^(-1/4) via the coupled production: normalise by λmax, ridge into [ridge,1], iterate."""
     L = 0.5 * (L + L.t())
     lam = _power_iter_max(L)
     if not (lam > 0 and np.isfinite(lam)):
@@ -116,73 +134,108 @@ def inv_fourth_root(L, ridge, k, prec=Prec.fp32):
     return Y * (lam ** -0.25)
 
 
-def rms_normalize(P):
-    return P / (P.square().mean().sqrt() + 1e-12)
+# ----------------------------- shared post-direction machinery (Muon's) -----------------------------
+def apply_norm_caution_update(D, p, st, lr, wd, beta2):
+    """NorMuon variance reduction + cautious WD/update, lifted from muon_step_unfused (per-param).
+    `D` is the arm's already-Nesterov-smoothed direction; this is identical across all arms."""
+    red_dim = -1 if p.shape[-2] >= p.shape[-1] else -2
+    g = D
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    rds = g.size(red_dim)
+    v_norm = (v_mean.sum(dim=(-2, -1), keepdim=True) * rds).sqrt()
+    if st.get("v2") is None or st["v2"].shape != v_mean.shape:
+        st["v2"] = torch.zeros_like(v_mean)
+    st["v2"].lerp_(v_mean, 1 - beta2)
+    step_size = st["v2"].clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * rds) * step_size.square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+    mask = (g * p) >= 0
+    p.sub_((lr * g + lr * wd * p * mask).to(p.dtype))
 
 
-def run_arm(arm, args, model, train_batches, val_batches, device):
+def _nesterov(grad, st, momentum):
+    st["mom"].lerp_(grad, 1 - momentum)
+    return grad.lerp(st["mom"], momentum)
+
+
+def _shampoo_dir(gm, st):
+    return (st["Linv"] @ gm.float() @ st["Rinv"]).to(gm.dtype)
+
+
+def direction(arm, p, st, grad, args, step):
+    gm = _nesterov(grad, st, args.momentum)
+    use_precond = step >= args.warmup_steps and st.get("Linv") is not None
+    if arm == "sgd":
+        return gm
+    if arm == "muon":
+        return polar_express_orth(gm, args.ns_steps)
+    if arm == "shampoo":
+        return _shampoo_dir(gm, st) if use_precond else gm
+    if arm == "ortho_shampoo":
+        if not use_precond:
+            return polar_express_orth(gm, args.ns_steps)
+        return polar_express_orth(_shampoo_dir(gm, st), args.ns_steps)
+    if arm == "layer_adaptive":
+        if not use_precond:
+            return polar_express_orth(gm, args.ns_steps)
+        if st.get("kappa", 1.0) > args.kappa_threshold:
+            return polar_express_orth(_shampoo_dir(gm, st), args.ns_steps)
+        return polar_express_orth(gm, args.ns_steps)
+    raise ValueError(arm)
+
+
+def run_arm(arm, lr, args, model, train_batches, val_batches, device):
     mp = matrix_params(model)
     mp_set = {id(p) for p in mp}
     other = [p for p in model.parameters() if id(p) not in mp_set]
     adam = torch.optim.AdamW(other, lr=args.adam_lr, betas=(0.9, 0.95), weight_decay=0.0)
-    mom = [torch.zeros_like(p) for p in mp]
-    # Shampoo Kronecker factors
-    facs = [{"L": torch.zeros(p.shape[0], p.shape[0], device=device),
-             "R": torch.zeros(p.shape[1], p.shape[1], device=device),
-             "Linv": None, "Rinv": None} for p in mp]
+    state = [{"mom": torch.zeros_like(p), "v2": None,
+              "L": torch.zeros(p.shape[0], p.shape[0], device=device),
+              "R": torch.zeros(p.shape[1], p.shape[1], device=device),
+              "Linv": None, "Rinv": None, "kappa": 1.0} for p in mp]
+    needs_factors = arm in ("shampoo", "ortho_shampoo", "layer_adaptive")
 
-    log = {"train_loss": [], "val_steps": [], "val_loss": []}
+    log = {"step": [], "val": [], "wall_ms": []}
+    ev_start = torch.cuda.Event(enable_timing=True); ev_start.record()
     for step in range(1, args.num_iterations + 1):
         x, y = train_batches[step - 1]
         loss = model(x, y)
-        model.zero_grad(set_to_none=True)
-        adam.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True); adam.zero_grad(set_to_none=True)
         loss.backward()
-
         lrm = min(1.0, step / max(1, args.warmup_steps))
         with torch.no_grad():
             for j, p in enumerate(mp):
-                g = p.grad
-                if g is None:
+                if p.grad is None:
                     continue
-                mom[j].mul_(args.momentum).add_(g, alpha=1 - args.momentum)
-                gm = g.add(mom[j], alpha=args.momentum)  # Nesterov-style lookahead
-                if arm == "muon":
-                    P = polar_express_orth(gm, args.ns_steps).float()
-                elif arm == "sgd":
-                    P = gm.float()
-                elif arm == "shampoo":
-                    gf = g.float()
-                    f = facs[j]
-                    f["L"].mul_(args.shampoo_beta).add_(gf @ gf.t(), alpha=1 - args.shampoo_beta)
-                    f["R"].mul_(args.shampoo_beta).add_(gf.t() @ gf, alpha=1 - args.shampoo_beta)
-                    if step < args.warmup_steps:
-                        P = gm.float()  # warm up factors before preconditioning
-                    else:
-                        if f["Linv"] is None or (step % args.shampoo_recompute_every == 0):
-                            f["Linv"] = inv_fourth_root(f["L"], args.shampoo_ridge,
-                                                        args.shampoo_coupled_steps)
-                            f["Rinv"] = inv_fourth_root(f["R"], args.shampoo_ridge,
-                                                        args.shampoo_coupled_steps)
-                        P = f["Linv"] @ gm.float() @ f["Rinv"]
-                else:
-                    raise ValueError(arm)
-                if not torch.isfinite(P).all():
-                    P = gm.float()  # robustness: fall back to momentum direction
-                upd = rms_normalize(P).to(p.dtype)
-                p.add_(upd, alpha=-args.matrix_lr * lrm)
-        for g_ in adam.param_groups:
-            g_["lr"] = args.adam_lr * lrm
+                st = state[j]
+                if needs_factors:
+                    gf = p.grad.float()
+                    st["L"].mul_(args.shampoo_beta).add_(gf @ gf.t(), alpha=1 - args.shampoo_beta)
+                    st["R"].mul_(args.shampoo_beta).add_(gf.t() @ gf, alpha=1 - args.shampoo_beta)
+                    if step >= args.warmup_steps and (st["Linv"] is None
+                                                      or step % args.shampoo_recompute_every == 0):
+                        st["Linv"] = inv_fourth_root(st["L"], args.shampoo_ridge, args.shampoo_coupled_steps)
+                        st["Rinv"] = inv_fourth_root(st["R"], args.shampoo_ridge, args.shampoo_coupled_steps)
+                        if arm == "layer_adaptive":
+                            st["kappa"] = max(_kappa_proxy(st["L"]), _kappa_proxy(st["R"]))
+                D = direction(arm, p, st, p.grad, args, step)
+                if not torch.isfinite(D).all():
+                    D = _nesterov(p.grad, st, args.momentum)  # robustness fallback
+                apply_norm_caution_update(D, p, st, lr * lrm, args.weight_decay, args.beta2)
+        for gpar in adam.param_groups:
+            gpar["lr"] = args.adam_lr * lrm
         adam.step()
-
-        log["train_loss"].append(float(loss.item()))
         if step % args.eval_every == 0 or step == 1:
+            torch.cuda.synchronize()
+            ev_now = torch.cuda.Event(enable_timing=True); ev_now.record(); torch.cuda.synchronize()
             with torch.no_grad():
                 vl = float(np.mean([float(model(vx, vy).item()) for vx, vy in val_batches]))
-            log["val_steps"].append(step)
-            log["val_loss"].append(vl)
-            print(f"  [{arm:8s}] step {step:4d}/{args.num_iterations}  "
-                  f"train {log['train_loss'][-1]:.4f}  val {vl:.4f}")
+            log["step"].append(step); log["val"].append(vl)
+            log["wall_ms"].append(ev_start.elapsed_time(ev_now))
+            print(f"  [{arm:14s} lr{lr:.3f}] step {step:4d}/{args.num_iterations}  "
+                  f"val {vl:.4f}  ({log['wall_ms'][-1]/1000:.1f}s)")
     return log
 
 
@@ -191,60 +244,56 @@ def main():
     _, _, _, world, device = compute_init("cuda")
     assert world == 1
     torch.set_float32_matmul_precision("high")
-    tok = get_tokenizer()
-    vocab = tok.get_vocab_size()
+    tok = get_tokenizer(); vocab = tok.get_vocab_size()
 
-    # pre-materialise identical train + val batches for every arm (same data, same order)
-    loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-        tok, args.device_batch_size, args.max_seq_len, split="train", device=device,
-        resume_state_dict=None)
-    train_batches = []
-    for _ in range(args.num_iterations):
-        x, y, _ = next(loader)
-        train_batches.append((x.clone(), y.clone()))
-    vloader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
-        tok, args.device_batch_size, args.max_seq_len, split="val", device=device,
-        resume_state_dict=None)
-    val_batches = []
-    for _ in range(args.n_val_batches):
-        x, y, _ = next(vloader)
-        val_batches.append((x.clone(), y.clone()))
-    print(f"materialised {len(train_batches)} train + {len(val_batches)} val batches; "
-          f"depth {args.depth}, vocab {vocab}")
+    def materialise(split, n):
+        loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+            tok, args.device_batch_size, args.max_seq_len, split=split, device=device,
+            resume_state_dict=None)
+        out = []
+        for _ in range(n):
+            x, y, _ = next(loader)
+            out.append((x.clone(), y.clone()))
+        return out
+    train_batches = materialise("train", args.num_iterations)
+    val_batches = materialise("val", args.n_val_batches)
+    print(f"depth {args.depth}, vocab {vocab}, {len(train_batches)} train + {len(val_batches)} val batches")
 
     arms = args.arms.split(",")
+    lr_grid = [float(x) for x in args.matrix_lr_grid.split(",")]
     results = {"config": vars(args), "arms": {}}
     t0 = time.time()
     for arm in arms:
-        print(f"\n=== arm: {arm} ===")
-        model, model_dim = build_model(args, vocab, device, args.seed)
-        results["config"]["model_dim"] = model_dim
-        log = run_arm(arm, args, model, train_batches, val_batches, device)
-        results["arms"][arm] = log
-        del model
-        torch.cuda.empty_cache()
+        best = None
+        for lr in lr_grid:
+            print(f"\n=== arm: {arm}  lr={lr} ===")
+            model, model_dim = build_model(args, vocab, device, args.seed)
+            results["config"]["model_dim"] = model_dim
+            log = run_arm(arm, lr, args, model, train_batches, val_batches, device)
+            del model; torch.cuda.empty_cache()
+            bestv = min(log["val"])
+            if best is None or bestv < best["best_val"]:
+                best = {"lr": lr, "best_val": bestv, "final_val": log["val"][-1],
+                        "total_wall_s": log["wall_ms"][-1] / 1000, "curve": log}
+        results["arms"][arm] = best
 
-    # summary
-    print("\n" + "=" * 64)
-    print(f"{'arm':10s} {'final train(sm50)':>18s} {'best val':>10s} {'final val':>10s}")
-    summary = {}
-    for arm, log in results["arms"].items():
-        sm = float(np.mean(log["train_loss"][-50:]))
-        bestv = float(min(log["val_loss"]))
-        finv = float(log["val_loss"][-1])
-        summary[arm] = {"final_train_sm50": sm, "best_val": bestv, "final_val": finv}
-        print(f"{arm:10s} {sm:18.4f} {bestv:10.4f} {finv:10.4f}")
-    results["summary"] = summary
+    # summary + gates
+    print("\n" + "=" * 72)
+    print(f"{'arm':16s} {'best lr':>8s} {'best val':>9s} {'final val':>9s} {'wall(s)':>9s}")
+    for arm, b in results["arms"].items():
+        print(f"{arm:16s} {b['lr']:8.3f} {b['best_val']:9.4f} {b['final_val']:9.4f} {b['total_wall_s']:9.1f}")
+    s = results["arms"]
+    if "muon" in s:
+        mu = s["muon"]["best_val"]
+        for arm in ("shampoo", "ortho_shampoo", "layer_adaptive"):
+            if arm in s:
+                results.setdefault("gates", {})[f"{arm}_beats_muon_val"] = bool(s[arm]["best_val"] < mu)
+        if "ortho_shampoo" in s and "shampoo" in s:
+            results["gates"]["gate1_ortho_beats_both"] = bool(
+                s["ortho_shampoo"]["best_val"] < min(mu, s["shampoo"]["best_val"]))
     results["runtime_min"] = (time.time() - t0) / 60.0
-    # verdict: shampoo-coupled trains competitively with muon (final val within 3% or better)
-    if "shampoo" in summary and "muon" in summary:
-        ratio = summary["shampoo"]["best_val"] / summary["muon"]["best_val"]
-        results["shampoo_vs_muon_best_val_ratio"] = ratio
-        results["shampoo_trains_competitively"] = bool(ratio <= 1.03)
-        print(f"\nshampoo/muon best-val ratio: {ratio:.4f}  "
-              f"-> coupled-Shampoo {'competitive' if ratio <= 1.03 else 'worse'} with Muon")
     GNS_OUT.write_text(json.dumps(results, indent=1))
-    print(f"wrote {GNS_OUT}  ({results['runtime_min']:.1f} min)")
+    print(f"\nwrote {GNS_OUT}  ({results['runtime_min']:.1f} min)  gates: {results.get('gates', {})}")
     compute_cleanup()
 
 
