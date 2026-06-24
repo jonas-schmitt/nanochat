@@ -76,6 +76,9 @@ def parse_args():
     p.add_argument("--polar-precs", type=str, default="",
                    help="③ per-step precision (comma list, e.g. fp8e4m3,bf16,...); default all bf16")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the model fwd/bwd (math-preserving; speeds every arm equally, "
+                        "so fairness/wall-clock gate stay valid). Worth it for the heavier d12 runs.")
     return p.parse_args()
 
 
@@ -105,7 +108,9 @@ def build_model(args, vocab_size, device, seed):
 
 
 def matrix_params(model):
-    return [p for p in model.transformer.h.parameters() if p.dim() == 2]
+    # robust to a torch.compile OptimizedModule wrapper (params live on _orig_mod)
+    m = getattr(model, "_orig_mod", model)
+    return [p for p in m.transformer.h.parameters() if p.dim() == 2]
 
 
 # ----------------------------- coupled inverse 1/4-root -----------------------------
@@ -257,6 +262,7 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
 
 def main():
     args = parse_args()
+    sys.stdout.reconfigure(line_buffering=True)  # stream logs live to file (no block-buffering blind spot)
     _, _, _, world, device = compute_init("cuda")
     assert world == 1
     torch.set_float32_matmul_precision("high")
@@ -278,13 +284,16 @@ def main():
     args._polar_schedule = build_polar_schedule(args)
     arms = args.arms.split(",")
     lr_grid = [float(x) for x in args.matrix_lr_grid.split(",")]
-    results = {"config": vars(args), "arms": {}}
+    # exclude private attrs (e.g. _polar_schedule = tuple of PolarStep) — not JSON-serializable
+    results = {"config": {k: v for k, v in vars(args).items() if not k.startswith("_")}, "arms": {}}
     t0 = time.time()
     for arm in arms:
         best = None
         for lr in lr_grid:
             print(f"\n=== arm: {arm}  lr={lr} ===")
             model, model_dim = build_model(args, vocab, device, args.seed)
+            if args.compile:
+                model = torch.compile(model, dynamic=False)  # rebuilt per (arm,lr): warmup amortised over num-iterations
             results["config"]["model_dim"] = model_dim
             log = run_arm(arm, lr, args, model, train_batches, val_batches, device)
             del model; torch.cuda.empty_cache()
