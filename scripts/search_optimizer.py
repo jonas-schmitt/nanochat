@@ -60,10 +60,15 @@ _SEARCH_KEYS = ("depth_small", "depth_large", "eval_iters", "n_steps", "pop", "l
 
 
 def _save_ckpt(state):
-    """Atomic per-generation checkpoint so the search can be stopped and resumed (same OUT --tag)."""
-    tmp = OUT_CKPT.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1))
-    os.replace(tmp, OUT_CKPT)
+    """Atomic + durable checkpoint (tmp + fsync + os.replace). A transient FS error warns but does not
+    crash the search — the previous good checkpoint stays valid."""
+    try:
+        tmp = OUT_CKPT.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=1); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, OUT_CKPT)
+    except OSError as e:
+        print(f"  [warn] checkpoint save failed ({e}); continuing — previous checkpoint intact")
 
 
 def _ser_cache(cache):
@@ -75,17 +80,27 @@ def _deser_cache(d):
 
 
 def load_ckpt(args):
-    if args.restart or not OUT_CKPT.exists():
+    """Resume the search unless --restart. Refuses to SILENTLY overwrite: corrupt/mismatch is a hard
+    error (use --restart to discard)."""
+    if args.restart:
+        if OUT_CKPT.exists():
+            print(f"[restart] discarding existing search checkpoint {OUT_CKPT.name}")
+        return None
+    if not OUT_CKPT.exists():
         return None
     try:
         s = json.loads(OUT_CKPT.read_text())
-    except Exception:
-        return None
+    except Exception as e:
+        raise SystemExit(f"[abort] search checkpoint {OUT_CKPT} unreadable/corrupt ({e}). "
+                         f"Pass --restart to discard it.")
     old = s.get("config", {})
     if [old.get(k) for k in _SEARCH_KEYS] != [getattr(args, k) for k in _SEARCH_KEYS]:
-        print("[resume] search checkpoint config differs from current args — starting fresh")
-        return None
-    print(f"[resume] loaded {OUT_CKPT.name}: {s['gen_done'] + 1} generation(s) done")
+        raise SystemExit("[abort] search checkpoint config differs from current args. "
+                         "Pass --restart to discard it.")
+    tmp = OUT_CKPT.with_suffix(".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    print(f"[resume] loaded {OUT_CKPT.name}")
     return s
 
 
@@ -143,8 +158,9 @@ def scalar_stable(triples, hi=1.0):
 
 # ---------------------------- evaluator (reuses the harness) ----------------------------
 def _run(depth, iters, args, polar=None):
+    fd, out = tempfile.mkstemp(suffix=".json"); os.close(fd)  # unique per call -> race-free
     cmd = [sys.executable, "-u", HARNESS, "--depth", str(depth), "--num-iterations", str(iters),
-           "--matrix-lr-grid", args.matrix_lr, "--eval-every", str(iters)]
+           "--matrix-lr-grid", args.matrix_lr, "--eval-every", str(iters), "--out", out]
     if polar is None:
         cmd += ["--arms", "muon"]
     else:
@@ -157,11 +173,15 @@ def _run(depth, iters, args, polar=None):
     arm = "muon" if polar is None else "searched_polar"
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=3600, env=env)
-        res = json.loads(HARNESS_OUT.read_text())
-        return float(res["arms"][arm]["best_val"])
+        return float(json.loads(Path(out).read_text())["arms"][arm]["best_val"])
     except Exception as e:
         print(f"   run failed ({arm} d{depth}): {type(e).__name__}")
         return float("inf")
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
 
 
 def muon_baseline(args, depth, iters, cache):
@@ -204,28 +224,44 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
     rng = np.random.default_rng(args.seed)
     ck = load_ckpt(args)
+    gates = {}
     if ck:  # resume
         muon_cache = _deser_cache(ck["muon_cache"])
         pop = [([tuple(t) for t in tr], list(pr)) for tr, pr in ck["population"]]
         history = ck["history"]
-        best = (ck["best"][0], ([tuple(t) for t in ck["best"][1][0]], ck["best"][1][1])) if ck["best"] else None
-        start_gen = ck["gen_done"] + 1
+        best = (ck["best"][0], ([tuple(t) for t in ck["best"][1][0]], ck["best"][1][1])) if ck.get("best") else None
+        gates = ck.get("gates", {})
         rng.bit_generator.state = ck["rng_state"]
+        if ck.get("in_gen") is not None:  # killed mid-generation
+            start_gen = ck["in_gen"]
+            resume_partial = [(F, ([tuple(t) for t in tr], pr)) for F, (tr, pr) in ck.get("partial", [])]
+        else:
+            start_gen = ck["gen_done"] + 1
+            resume_partial = []
+        print(f"[resume] start_gen={start_gen}, {len(resume_partial)} candidate(s) already scored in it")
     else:  # fresh — prime the two fitness baselines, seed from cubic NS + Muon quintic
         muon_cache = {}
         muon_baseline(args, args.depth_small, args.eval_iters, muon_cache)
         muon_baseline(args, args.depth_large, args.eval_iters, muon_cache)
         pop = seed_population(args.n_steps, args.pop, rng)
-        history, best, start_gen = [], None, 0
+        history, best, start_gen, resume_partial = [], None, 0, []
+
+    def snapshot(gen_done, in_gen, partial):
+        return {"config": vars(args), "gen_done": gen_done, "in_gen": in_gen, "partial": partial,
+                "population": pop, "history": history, "best": best, "gates": gates,
+                "muon_cache": _ser_cache(muon_cache), "rng_state": rng.bit_generator.state}
 
     for gen in range(start_gen, args.gens):
-        scored = []
-        for sched in pop:
+        scored = resume_partial if gen == start_gen else []
+        resume_partial = []
+        for idx in range(len(scored), len(pop)):
+            sched = pop[idx]
             F, info = fitness(sched, args, muon_cache)
             scored.append((F, sched))
             tag = info.get("reason", f"gap_s {info.get('gap_small', float('nan')):+.3f} "
                                      f"gap_l {info.get('gap_large', float('nan')):+.3f}")
             print(f"gen {gen} F {F:.4f}  {tag}  precs {sched[1]}")
+            _save_ckpt(snapshot(gen - 1, gen, scored))  # per-candidate checkpoint
         scored.sort(key=lambda t: t[0])
         history.append({"gen": gen, "best_F": scored[0][0]})
         if best is None or scored[0][0] < best[0]:
@@ -233,33 +269,31 @@ def main():
         elites = [s for _, s in scored[: max(2, args.pop // 4)]]
         pop = elites + [mutate(elites[int(rng.integers(len(elites)))], rng)
                         for _ in range(args.pop - len(elites))]
-        _save_ckpt({"config": vars(args), "gen_done": gen, "population": pop, "history": history,
-                    "best": best, "muon_cache": _ser_cache(muon_cache),
-                    "rng_state": rng.bit_generator.state})
-        print(f"[checkpoint] gen {gen} saved -> {OUT_CKPT.name}")
+        _save_ckpt(snapshot(gen, None, []))  # generation-complete checkpoint
+        print(f"[checkpoint] gen {gen} complete -> {OUT_CKPT.name}")
 
-    # gates on the winner: horizon transfer + scale transfer
+    # gates on the winner (each checkpointed so a stop resumes without re-running completed gates)
     print("\n=== gates on winner ===")
-    if not np.isfinite(best[0]):
+    if best is None or not np.isfinite(best[0]):
         print("no viable (stable, finite-fitness) candidate found — skipping gates")
         OUT.write_text(json.dumps({"config": vars(args), "history": history,
                                    "winner": None, "note": "no viable candidate"}, indent=1))
         return
-    horizon_val = _run(args.depth_large, args.transfer_iters, args, polar=best[1])
-    horizon_muon = muon_baseline(args, args.depth_large, args.transfer_iters, muon_cache)
-    scale = scale_transfer_gate(best[1], args, muon_cache)
-    result = {
-        "config": vars(args), "history": history,
-        "winner": {"triples": best[1][0], "precs": best[1][1], "best_F": best[0]},
-        "gates": {
-            "horizon_transfer": {"val": horizon_val, "muon": horizon_muon,
-                                 "pass": bool(horizon_val < horizon_muon)},
-            "scale_transfer": scale,
-        },
-    }
+    if "horizon" not in gates:
+        hv = _run(args.depth_large, args.transfer_iters, args, polar=best[1])
+        hm = muon_baseline(args, args.depth_large, args.transfer_iters, muon_cache)
+        gates["horizon"] = {"val": hv, "muon": hm, "pass": bool(hv < hm)}
+        _save_ckpt(snapshot(args.gens - 1, None, []))
+    if "scale" not in gates:
+        gates["scale"] = scale_transfer_gate(best[1], args, muon_cache)
+        _save_ckpt(snapshot(args.gens - 1, None, []))
+    result = {"config": vars(args), "history": history,
+              "winner": {"triples": best[1][0], "precs": best[1][1], "best_F": best[0]},
+              "gates": {"horizon_transfer": gates["horizon"], "scale_transfer": gates["scale"]}}
     OUT.write_text(json.dumps(result, indent=1))
-    print(f"\nwinner F {best[0]:.4f}  horizon {'PASS' if result['gates']['horizon_transfer']['pass'] else 'FAIL'}"
-          f"  scale-slope {scale['gap_vs_logwidth_slope']:+.4f} {'PASS' if scale['pass'] else 'FAIL'}  -> {OUT}")
+    print(f"\nwinner F {best[0]:.4f}  horizon {'PASS' if gates['horizon']['pass'] else 'FAIL'}"
+          f"  scale-slope {gates['scale']['gap_vs_logwidth_slope']:+.4f} "
+          f"{'PASS' if gates['scale']['pass'] else 'FAIL'}  -> {OUT}")
 
 
 if __name__ == "__main__":

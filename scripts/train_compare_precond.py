@@ -26,6 +26,7 @@ Run (tct-models env + gns on path):
 """
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -46,6 +47,17 @@ from gns.fused import PolarStep, run_polar_2d  # noqa: E402
 from gns.precision import TORCH_DTYPE, Prec  # noqa: E402
 
 GNS_OUT = Path("/home/jonas/git/gns/results/precond_train_compare.json")
+
+
+def _atomic_write(path, payload):
+    """Crash-safe JSON write: tmp + fsync + os.replace (never leaves a partial/corrupt file)."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def parse_args():
@@ -79,6 +91,9 @@ def parse_args():
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the model fwd/bwd (math-preserving; speeds every arm equally, "
                         "so fairness/wall-clock gate stay valid). Worth it for the heavier d12 runs.")
+    p.add_argument("--out", type=str, default="",
+                   help="output JSON path (default: the shared GNS_OUT). Per-(arm,lr) results are "
+                        "checkpointed here so an interrupted run resumes, skipping completed sub-runs.")
     return p.parse_args()
 
 
@@ -284,24 +299,49 @@ def main():
     args._polar_schedule = build_polar_schedule(args)
     arms = args.arms.split(",")
     lr_grid = [float(x) for x in args.matrix_lr_grid.split(",")]
+    out_path = Path(args.out) if args.out else GNS_OUT
     # exclude private attrs (e.g. _polar_schedule = tuple of PolarStep) — not JSON-serializable
-    results = {"config": {k: v for k, v in vars(args).items() if not k.startswith("_")}, "arms": {}}
+    cfg = {k: v for k, v in vars(args).items() if not k.startswith("_")}
+    base_dim = args.depth * args.aspect_ratio
+    cfg["model_dim"] = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
+
+    # resume: reuse completed (arm,lr) sub-runs from a prior partial run of THIS out file
+    done = {}
+    if out_path.exists():
+        try:
+            prev = json.loads(out_path.read_text()); pc = prev.get("config", {})
+            sig = ("depth", "seed", "arms", "matrix_lr_grid", "num_iterations", "device_batch_size")
+            if [pc.get(k) for k in sig] == [cfg[k] for k in sig]:
+                done = prev.get("_done", {})
+                if done:
+                    print(f"[resume] {out_path.name}: {len(done)} (arm,lr) sub-runs already complete")
+        except Exception:
+            done = {}
+
+    results = {"config": cfg, "_done": done, "arms": {}}
     t0 = time.time()
     for arm in arms:
-        best = None
         for lr in lr_grid:
+            key = f"{arm}|{lr:.6g}"
+            if key in done:
+                print(f"=== arm: {arm}  lr={lr}  [resume: skip] ===")
+                continue
             print(f"\n=== arm: {arm}  lr={lr} ===")
-            model, model_dim = build_model(args, vocab, device, args.seed)
+            model, _ = build_model(args, vocab, device, args.seed)
             if args.compile:
                 model = torch.compile(model, dynamic=False)  # rebuilt per (arm,lr): warmup amortised over num-iterations
-            results["config"]["model_dim"] = model_dim
             log = run_arm(arm, lr, args, model, train_batches, val_batches, device)
             del model; torch.cuda.empty_cache()
-            bestv = min(log["val"])
-            if best is None or bestv < best["best_val"]:
-                best = {"lr": lr, "best_val": bestv, "final_val": log["val"][-1],
-                        "total_wall_s": log["wall_ms"][-1] / 1000, "curve": log}
-        results["arms"][arm] = best
+            done[key] = {"arm": arm, "lr": lr, "best_val": min(log["val"]), "final_val": log["val"][-1],
+                         "total_wall_s": log["wall_ms"][-1] / 1000, "curve": log}
+            _atomic_write(out_path, {"config": cfg, "_done": done})  # checkpoint after each sub-run
+
+    # finalize: best lr per arm from the completed sub-runs
+    for arm in arms:
+        cand = [v for v in done.values() if v["arm"] == arm]
+        b = min(cand, key=lambda v: v["best_val"])
+        results["arms"][arm] = {"lr": b["lr"], "best_val": b["best_val"], "final_val": b["final_val"],
+                                "total_wall_s": b["total_wall_s"], "curve": b["curve"]}
 
     # summary + gates
     print("\n" + "=" * 72)
@@ -318,8 +358,8 @@ def main():
             results["gates"]["gate1_ortho_beats_both"] = bool(
                 s["ortho_shampoo"]["best_val"] < min(mu, s["shampoo"]["best_val"]))
     results["runtime_min"] = (time.time() - t0) / 60.0
-    GNS_OUT.write_text(json.dumps(results, indent=1))
-    print(f"\nwrote {GNS_OUT}  ({results['runtime_min']:.1f} min)  gates: {results.get('gates', {})}")
+    _atomic_write(out_path, results)
+    print(f"\nwrote {out_path}  ({results['runtime_min']:.1f} min)  gates: {results.get('gates', {})}")
     compute_cleanup()
 
 

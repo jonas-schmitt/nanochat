@@ -72,15 +72,17 @@ def parse_args():
     return p.parse_args()
 
 
-def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_):
+def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path):
+    # unique per-call --out (race-free) that the harness ALSO checkpoints per (arm,lr) to, so a driver
+    # restart resumes a half-done depth instead of recomputing it.
     cmd = [sys.executable, "-u", HARNESS, "--depth", str(depth), "--num-iterations", str(iters),
            "--arms", arms, "--matrix-lr-grid", lr_grid, "--device-batch-size", str(dbs),
-           "--max-seq-len", str(seq)]
+           "--max-seq-len", str(seq), "--out", str(out_path)]
     if compile_:
         cmd.append("--compile")
     env = {**os.environ, "PYTHONPATH": "/home/jonas/git/nanochat:/home/jonas/git/gns/src"}
     subprocess.run(cmd, check=True, env=env)  # inherits stdout -> streams live
-    return json.loads(HARNESS_OUT.read_text())
+    return json.loads(Path(out_path).read_text())
 
 
 def collect(res, arms_list):
@@ -95,10 +97,15 @@ def optimal_iters(depth, max_depth, args):
 
 
 def _save(payload, path):
-    """Atomic checkpoint write (tmp + os.replace) so a stop mid-write never corrupts the file."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=1))
-    os.replace(tmp, path)
+    """Atomic + durable checkpoint write (tmp + fsync + os.replace). A transient FS error warns but
+    does not crash the run — the previous good checkpoint stays valid."""
+    try:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=1); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"  [warn] checkpoint save failed ({e}); continuing — previous checkpoint intact")
 
 
 def _fit_trend(rungs, candidates, name):
@@ -128,8 +135,9 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
         it = iters_of(d)
         print(f"\n===== depth {d} (width {width(d)}, ~{nonembed_params(d)/1e6:.1f}M non-embed) "
               f"x {it} iters =====")
+        sub_out = RESULTS_DIR / f"precond_{args.tag or 'default'}_{name}_d{d}.json"
         res = run_harness(d, ",".join(arms_list), it, args.matrix_lr_grid,
-                          args.device_batch_size, args.max_seq_len, args.compile)
+                          args.device_batch_size, args.max_seq_len, args.compile, sub_out)
         arms = collect(res, arms_list)
         rec = {"depth": d, "width": width(d), "nonembed_params": nonembed_params(d),
                "iters": it, "arms": arms, "candidates": {}}
@@ -155,19 +163,27 @@ _CKPT_KEYS = ("depths", "arms", "matrix_lr_grid", "fixed_iters", "opt_max_iters"
 
 
 def load_or_init(path, args, depths, baseline, candidates):
-    """Resume from an existing checkpoint for this --tag unless --restart or config changed."""
+    """Resume from an existing checkpoint for this --tag. Refuses to SILENTLY overwrite prior work: a
+    corrupt file or a config mismatch is a hard error (use --restart to discard, or a new --tag)."""
     fresh = {"config": vars(args), "depths": depths, "baseline": baseline, "candidates": candidates}
-    if args.restart or not path.exists():
+    if args.restart:
+        if path.exists():
+            print(f"[restart] discarding existing checkpoint {path.name}")
+        return fresh
+    if not path.exists():
         return fresh
     try:
         p = json.loads(path.read_text())
-    except Exception:
-        return fresh
+    except Exception as e:
+        raise SystemExit(f"[abort] checkpoint {path} is unreadable/corrupt ({e}). "
+                         f"Pass --restart to discard it, or use a different --tag.")
     old = p.get("config", {})
     if [old.get(k) for k in _CKPT_KEYS] != [getattr(args, k) for k in _CKPT_KEYS]:
-        print("[resume] checkpoint config differs from current args — starting fresh "
-              "(use a new --tag to keep the old run)")
-        return fresh
+        raise SystemExit(f"[abort] checkpoint {path.name} config differs from current args "
+                         f"(would mix incompatible runs). Use a new --tag, or --restart to discard.")
+    tmp = path.with_suffix(path.suffix + ".tmp")  # clear stale tmp from a prior crash mid-write
+    if tmp.exists():
+        tmp.unlink()
     done = {m: [r["depth"] for r in p.get(f"pass_{m}", {}).get("rungs", [])]
             for m in ("fixed", "optimal") if f"pass_{m}" in p}
     print(f"[resume] loaded {path.name}: completed rungs {done}")
@@ -180,8 +196,9 @@ def batch_sweep(args, candidates, baseline, arms_list):
     print(f"\n########## overhead-vs-batch probe (depth {args.batch_sweep_depth}) ##########")
     out = []
     for bs in [int(x) for x in args.batch_sweep.split(",")]:
+        sub_out = RESULTS_DIR / f"precond_{args.tag or 'default'}_batch{bs}.json"
         res = run_harness(args.batch_sweep_depth, ",".join(arms_list), args.batch_sweep_iters,
-                          args.matrix_lr_grid, bs, args.max_seq_len, args.compile)
+                          args.matrix_lr_grid, bs, args.max_seq_len, args.compile, sub_out)
         arms = collect(res, arms_list)
         wmuon = arms[baseline]["wall_s"]
         row = {"batch": bs, "tokens_per_step": bs * args.max_seq_len,
