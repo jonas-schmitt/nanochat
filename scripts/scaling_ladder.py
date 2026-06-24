@@ -76,6 +76,8 @@ def parse_args():
     p.add_argument("--compile", action="store_true")
     p.add_argument("--synth-alpha", type=float, default=1.0, help="passed to the harness synth arm")
     p.add_argument("--synth-ortho", type=int, default=1, help="passed to the harness synth arm")
+    p.add_argument("--precond-coupled-orders", type=str, default="",
+                   help="grammar CoupledStep order sequence passed to the harness inverse-root")
     p.add_argument("--tag", type=str, default="")
     p.add_argument("--restart", action="store_true",
                    help="ignore any existing checkpoint for this --tag and start fresh")
@@ -83,14 +85,15 @@ def parse_args():
 
 
 def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path, seed=0,
-                synth_alpha=1.0, synth_ortho=1):
+                synth_alpha=1.0, synth_ortho=1, precond_orders=""):
     # unique per-call --out (race-free) that the harness ALSO checkpoints per (arm,lr) to, so a driver
     # restart resumes a half-done depth instead of recomputing it. The harness resume signature includes
     # seed, so a seed-specific out_path resumes each seed independently.
     cmd = [sys.executable, "-u", HARNESS, "--depth", str(depth), "--num-iterations", str(iters),
            "--arms", arms, "--matrix-lr-grid", lr_grid, "--device-batch-size", str(dbs),
            "--max-seq-len", str(seq), "--seed", str(seed), "--synth-alpha", str(synth_alpha),
-           "--synth-ortho", str(synth_ortho), "--out", str(out_path)]
+           "--synth-ortho", str(synth_ortho), "--precond-coupled-orders", precond_orders,
+           "--out", str(out_path)]
     if compile_:
         cmd.append("--compile")
     env = {**os.environ, "PYTHONPATH": "/home/jonas/git/nanochat:/home/jonas/git/gns/src"}
@@ -172,7 +175,8 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
             sub_out = RESULTS_DIR / f"precond_{args.tag or 'default'}_{name}_d{d}_s{s}.json"
             res = run_harness(d, ",".join(arms_list), it, args.matrix_lr_grid,
                               args.device_batch_size, args.max_seq_len, args.compile, sub_out, seed=s,
-                              synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho)
+                              synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho,
+                              precond_orders=args.precond_coupled_orders)
             per_seed.append(collect(res, arms_list))
         rec = {"depth": d, "width": width(d), "nonembed_params": nonembed_params(d),
                "iters": it, "seeds": {s: per_seed[i] for i, s in enumerate(seeds)}, "candidates": {}}
@@ -206,7 +210,8 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
 
 
 _CKPT_KEYS = ("depths", "arms", "matrix_lr_grid", "seeds", "fixed_iters", "opt_max_iters",
-              "opt_min_iters", "device_batch_size", "max_seq_len", "synth_alpha", "synth_ortho")
+              "opt_min_iters", "device_batch_size", "max_seq_len", "synth_alpha", "synth_ortho",
+              "precond_coupled_orders")
 
 
 def load_or_init(path, args, depths, baseline, candidates):
@@ -246,7 +251,8 @@ def batch_sweep(args, candidates, baseline, arms_list):
         sub_out = RESULTS_DIR / f"precond_{args.tag or 'default'}_batch{bs}.json"
         res = run_harness(args.batch_sweep_depth, ",".join(arms_list), args.batch_sweep_iters,
                           args.matrix_lr_grid, bs, args.max_seq_len, args.compile, sub_out,
-                          synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho)
+                          synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho,
+                          precond_orders=args.precond_coupled_orders)
         arms = collect(res, arms_list)
         wmuon = arms[baseline]["wall_s"]; bmuon = arms[baseline]["best_val"]
         # record the val-loss GAP, not just overhead: the quality question is whether the

@@ -87,6 +87,9 @@ def parse_args():
     p.add_argument("--synth-ortho", type=int, default=1,
                    help="synth arm: 1 = polar-orthogonalize the (curvature-shaped) direction (Muon "
                         "robustness on top), 0 = raw Shampoo-style direction.")
+    p.add_argument("--precond-coupled-orders", type=str, default="",
+                   help="grammar-searched CoupledStep order sequence (e.g. '3,2,2,1') used for the "
+                        "Shampoo inverse-root instead of the uniform 24-step chain; empty = default.")
     p.add_argument("--n-val-batches", type=int, default=16)
     p.add_argument("--eval-every", type=int, default=50)
     p.add_argument("--arms", type=str, default="muon,shampoo,ortho_shampoo,layer_adaptive,sgd")
@@ -160,15 +163,18 @@ def _kappa_proxy(L, lam_max=None):
     return lam_max / max(lam_min, lam_max * 1e-12)
 
 
-def inv_fourth_root(L, ridge, k, prec=Prec.fp32):
+def inv_fourth_root(L, ridge, k, prec=Prec.fp32, orders=None):
     L = 0.5 * (L + L.t())
     lam = _power_iter_max(L)
     if not (lam > 0 and np.isfinite(lam)):
         return torch.eye(L.shape[0], device=L.device, dtype=torch.float32)
     n = L.shape[0]
     Ln = L / lam + ridge * torch.eye(n, device=L.device, dtype=L.dtype)
-    chain = (CoupledInit(root=4, lambda_min=ridge, lambda_max=1.0, prec=prec),) + tuple(
-        CoupledStep(root=4, prec=prec) for _ in range(k))
+    # `orders` (a grammar-searched CoupledStep order sequence, e.g. exp28's cheaper schedule) replaces
+    # the k uniform steps — same fp32-floor accuracy at fewer matmuls.
+    steps = (tuple(CoupledStep(root=4, order=o, prec=prec) for o in orders) if orders
+             else tuple(CoupledStep(root=4, prec=prec) for _ in range(k)))
+    chain = (CoupledInit(root=4, lambda_min=ridge, lambda_max=1.0, prec=prec),) + steps
     Y = coupled.matrix_apply(Ln.to(TORCH_DTYPE[prec]), chain).float()
     if not torch.isfinite(Y).all():
         return torch.eye(L.shape[0], device=L.device, dtype=torch.float32)
@@ -287,8 +293,8 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                     st["R"].mul_(args.shampoo_beta).add_(gf.t() @ gf, alpha=1 - args.shampoo_beta)
                     if step >= args.warmup_steps and (st["Linv"] is None
                                                       or step % args.shampoo_recompute_every == 0):
-                        st["Linv"] = inv_fourth_root(st["L"], args.shampoo_ridge, args.shampoo_coupled_steps)
-                        st["Rinv"] = inv_fourth_root(st["R"], args.shampoo_ridge, args.shampoo_coupled_steps)
+                        st["Linv"] = inv_fourth_root(st["L"], args.shampoo_ridge, args.shampoo_coupled_steps, orders=args._precond_orders)
+                        st["Rinv"] = inv_fourth_root(st["R"], args.shampoo_ridge, args.shampoo_coupled_steps, orders=args._precond_orders)
                         if arm == "layer_adaptive":
                             st["kappa"] = max(_kappa_proxy(st["L"]), _kappa_proxy(st["R"]))
                         if arm == "synth":
@@ -345,6 +351,8 @@ def main():
     print(f"depth {args.depth}, vocab {vocab}, {len(train_batches)} train + {len(val_batches)} val batches")
 
     args._polar_schedule = build_polar_schedule(args)
+    args._precond_orders = ([int(x) for x in args.precond_coupled_orders.split(",")]
+                            if args.precond_coupled_orders else None)
     arms = args.arms.split(",")
     lr_grid = [float(x) for x in args.matrix_lr_grid.split(",")]
     out_path = Path(args.out) if args.out else GNS_OUT
