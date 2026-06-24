@@ -80,6 +80,13 @@ def parse_args():
     p.add_argument("--shampoo-coupled-steps", type=int, default=24)
     p.add_argument("--shampoo-recompute-every", type=int, default=10)
     p.add_argument("--kappa-threshold", type=float, default=1e4)  # layer_adaptive routing
+    p.add_argument("--synth-alpha", type=float, default=1.0,
+                   help="synth arm: curvature strength in [0,1]. D = L^(-alpha/4) g R^(-alpha/4); "
+                        "alpha=0 -> Muon (no curvature), alpha=1 -> full Shampoo inverse-root. The "
+                        "alpha in (0,1) interior is the unexplored Muon<->Shampoo spectral middle.")
+    p.add_argument("--synth-ortho", type=int, default=1,
+                   help="synth arm: 1 = polar-orthogonalize the (curvature-shaped) direction (Muon "
+                        "robustness on top), 0 = raw Shampoo-style direction.")
     p.add_argument("--n-val-batches", type=int, default=16)
     p.add_argument("--eval-every", type=int, default=50)
     p.add_argument("--arms", type=str, default="muon,shampoo,ortho_shampoo,layer_adaptive,sgd")
@@ -198,6 +205,24 @@ def _shampoo_dir(gm, st):
     return (st["Linv"] @ gm.float() @ st["Rinv"]).to(gm.dtype)
 
 
+def _spd_power(M, a):
+    """SPD matrix raised to scalar power a (eigendecomp). a=1 -> M, a=0 -> I. Used by the synth arm to
+    interpolate curvature strength: (L^(-1/4))^a = L^(-a/4)."""
+    if a == 1.0:
+        return M
+    n = M.shape[0]
+    if a == 0.0:
+        return torch.eye(n, device=M.device, dtype=M.dtype)
+    evals, evecs = torch.linalg.eigh(0.5 * (M + M.t()))
+    return (evecs * evals.clamp_min(0).pow(a)) @ evecs.t()
+
+
+def _synth_dir(gm, st, args):
+    """Curvature-strength-interpolated direction L^(-a/4) g R^(-a/4), optional polar finisher."""
+    D = (st["Linv_a"] @ gm.float() @ st["Rinv_a"]).to(gm.dtype)
+    return polar_express_orth(D, args.ns_steps) if args.synth_ortho else D
+
+
 def direction(arm, p, st, grad, args, step):
     gm = _nesterov(grad, st, args.momentum)
     use_precond = step >= args.warmup_steps and st.get("Linv") is not None
@@ -219,6 +244,10 @@ def direction(arm, p, st, grad, args, step):
         if st.get("kappa", 1.0) > args.kappa_threshold:
             return polar_express_orth(_shampoo_dir(gm, st), args.ns_steps)
         return polar_express_orth(gm, args.ns_steps)
+    if arm == "synth":  # Muon<->Shampoo spectral interpolation (curvature strength alpha)
+        if not use_precond:
+            return polar_express_orth(gm, args.ns_steps) if args.synth_ortho else gm
+        return _synth_dir(gm, st, args)
     raise ValueError(arm)
 
 
@@ -227,11 +256,15 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
     mp_set = {id(p) for p in mp}
     other = [p for p in model.parameters() if id(p) not in mp_set]
     adam = torch.optim.AdamW(other, lr=args.adam_lr, betas=(0.9, 0.95), weight_decay=0.0)
+    # `adamw` baseline: matrix params on standard AdamW too (the conventional strong baseline, not just
+    # the SGD floor). Its LR is the swept matrix-lr, so pass an Adam-range --matrix-lr-grid for it.
+    madam = (torch.optim.AdamW(mp, lr=lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+             if arm == "adamw" else None)
     state = [{"mom": torch.zeros_like(p), "v2": None,
               "L": torch.zeros(p.shape[0], p.shape[0], device=device),
               "R": torch.zeros(p.shape[1], p.shape[1], device=device),
               "Linv": None, "Rinv": None, "kappa": 1.0} for p in mp]
-    needs_factors = arm in ("shampoo", "ortho_shampoo", "layer_adaptive")
+    needs_factors = arm in ("shampoo", "ortho_shampoo", "layer_adaptive", "synth")
 
     log = {"step": [], "val": [], "wall_ms": []}
     ev_start = torch.cuda.Event(enable_timing=True); ev_start.record()
@@ -245,6 +278,8 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
             for j, p in enumerate(mp):
                 if p.grad is None:
                     continue
+                if arm == "adamw":   # matrix params handled by the AdamW optimizer (madam) below
+                    continue
                 st = state[j]
                 if needs_factors:
                     gf = p.grad.float()
@@ -256,6 +291,9 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                         st["Rinv"] = inv_fourth_root(st["R"], args.shampoo_ridge, args.shampoo_coupled_steps)
                         if arm == "layer_adaptive":
                             st["kappa"] = max(_kappa_proxy(st["L"]), _kappa_proxy(st["R"]))
+                        if arm == "synth":
+                            st["Linv_a"] = _spd_power(st["Linv"], args.synth_alpha)
+                            st["Rinv_a"] = _spd_power(st["Rinv"], args.synth_alpha)
                 D = direction(arm, p, st, p.grad, args, step)
                 if not torch.isfinite(D).all():
                     D = _nesterov(p.grad, st, args.momentum)  # robustness fallback
@@ -263,6 +301,10 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
         for gpar in adam.param_groups:
             gpar["lr"] = args.adam_lr * lrm
         adam.step()
+        if madam is not None:
+            for g in madam.param_groups:
+                g["lr"] = lr * lrm
+            madam.step()
         if step % args.eval_every == 0 or step == 1:
             torch.cuda.synchronize()
             ev_now = torch.cuda.Event(enable_timing=True); ev_now.record(); torch.cuda.synchronize()
@@ -283,16 +325,22 @@ def main():
     torch.set_float32_matmul_precision("high")
     tok = get_tokenizer(); vocab = tok.get_vocab_size()
 
-    def materialise(split, n):
+    def materialise(split, n, resume_state_dict=None):
         loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
             tok, args.device_batch_size, args.max_seq_len, split=split, device=device,
-            resume_state_dict=None)
+            resume_state_dict=resume_state_dict)
         out = []
         for _ in range(n):
             x, y, _ = next(loader)
             out.append((x.clone(), y.clone()))
         return out
-    train_batches = materialise("train", args.num_iterations)
+    # Seed varies WEIGHT INIT (build_model) AND the TRAIN data window: starting at a
+    # different parquet shard per seed gives genuinely different documents, so the gap's
+    # spread across seeds is an honest replication-variance estimate (not init-only, which
+    # the paired difference would make artificially tight). VAL is held FIXED across seeds
+    # (common measuring stick). seed 0 -> offset 0 == the original single-seed behaviour.
+    train_resume = ({"pq_idx": args.seed, "rg_idx": 0, "epoch": 1} if args.seed else None)
+    train_batches = materialise("train", args.num_iterations, resume_state_dict=train_resume)
     val_batches = materialise("val", args.n_val_batches)
     print(f"depth {args.depth}, vocab {vocab}, {len(train_batches)} train + {len(val_batches)} val batches")
 

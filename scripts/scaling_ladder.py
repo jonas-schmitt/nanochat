@@ -55,29 +55,42 @@ def parse_args():
     p.add_argument("--arms", type=str, default="muon,ortho_shampoo",
                    help="first arm is the baseline (muon); the rest are candidates")
     p.add_argument("--matrix-lr-grid", type=str, default="0.005,0.01,0.02")
+    p.add_argument("--seeds", type=str, default="0",
+                   help="comma list of harness --seed values per rung; the gap is averaged "
+                        "(paired) across them. Default '0' keeps the single-seed behaviour; "
+                        "pass e.g. '0,1,2' for the load-bearing pass. Seeds vary WEIGHT INIT "
+                        "only (the data loader is deterministic).")
     p.add_argument("--mode", choices=["fixed", "optimal", "both"], default="both")
     p.add_argument("--fixed-iters", type=int, default=2000)
     p.add_argument("--opt-max-iters", type=int, default=2500, help="iters at the largest depth in optimal mode")
     p.add_argument("--opt-min-iters", type=int, default=300)
     p.add_argument("--device-batch-size", type=int, default=16)
     p.add_argument("--max-seq-len", type=int, default=1024)
-    p.add_argument("--batch-sweep", type=str, default="8,16,32",
-                   help="device-batch sizes for the overhead-vs-batch probe; empty to skip")
+    p.add_argument("--batch-sweep", type=str, default="16,32,64,128",
+                   help="device-batch sizes for the overhead-AND-gap-vs-batch probe; empty to "
+                        "skip. Swept UPWARD toward frontier batch: overhead amortizes ~1/batch, "
+                        "and the val-loss gap is recorded to test whether the advantage SURVIVES "
+                        "at large batch (the quality gate). Single-seed (seed 0).")
     p.add_argument("--batch-sweep-depth", type=int, default=6)
     p.add_argument("--batch-sweep-iters", type=int, default=600)
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--synth-alpha", type=float, default=1.0, help="passed to the harness synth arm")
+    p.add_argument("--synth-ortho", type=int, default=1, help="passed to the harness synth arm")
     p.add_argument("--tag", type=str, default="")
     p.add_argument("--restart", action="store_true",
                    help="ignore any existing checkpoint for this --tag and start fresh")
     return p.parse_args()
 
 
-def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path):
+def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path, seed=0,
+                synth_alpha=1.0, synth_ortho=1):
     # unique per-call --out (race-free) that the harness ALSO checkpoints per (arm,lr) to, so a driver
-    # restart resumes a half-done depth instead of recomputing it.
+    # restart resumes a half-done depth instead of recomputing it. The harness resume signature includes
+    # seed, so a seed-specific out_path resumes each seed independently.
     cmd = [sys.executable, "-u", HARNESS, "--depth", str(depth), "--num-iterations", str(iters),
            "--arms", arms, "--matrix-lr-grid", lr_grid, "--device-batch-size", str(dbs),
-           "--max-seq-len", str(seq), "--out", str(out_path)]
+           "--max-seq-len", str(seq), "--seed", str(seed), "--synth-alpha", str(synth_alpha),
+           "--synth-ortho", str(synth_ortho), "--out", str(out_path)]
     if compile_:
         cmd.append("--compile")
     env = {**os.environ, "PYTHONPATH": "/home/jonas/git/nanochat:/home/jonas/git/gns/src"}
@@ -87,8 +100,8 @@ def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path):
 
 def collect(res, arms_list):
     s = res["arms"]
-    return {a: {"best_val": s[a]["best_val"], "lr": s[a]["lr"], "wall_s": s[a]["total_wall_s"]}
-            for a in arms_list}
+    return {a: {"best_val": s[a]["best_val"], "final_val": s[a]["final_val"],
+                "lr": s[a]["lr"], "wall_s": s[a]["total_wall_s"]} for a in arms_list}
 
 
 def optimal_iters(depth, max_depth, args):
@@ -109,23 +122,42 @@ def _save(payload, path):
 
 
 def _fit_trend(rungs, candidates, name):
+    """Honest verdict: a negative 2-point slope means NOTHING if the candidate is not a SIGNIFICANT
+    win (>2 sigma over seeds) at the rungs. Gate on significance + level sign, not slope alone — the
+    old slope-only verdict announced 'advantage grows with scale' for runs where the candidate lost
+    at every rung."""
     trend = {}
-    if len(rungs) >= 2:
-        lw = np.log([r["width"] for r in rungs])
-        for c in candidates:
-            gaps = np.array([r["candidates"][c]["gap"] for r in rungs])
-            slope = float(np.polyfit(lw, gaps, 1)[0])
-            trend[c] = {"gap_vs_logwidth_slope": slope,
-                        "verdict": ("advantage grows with scale" if slope < 0
-                                    else "advantage erodes with scale")}
-            print(f"  [{name}] TREND {c}: d(gap)/d(log width) = {slope:+.4f}  -> {trend[c]['verdict']}")
+    for c in candidates:
+        levels = [r["candidates"][c]["gap"] for r in rungs]
+        sig_rungs = [bool(r["candidates"][c].get("significant")) for r in rungs]
+        slope = None
+        if len(rungs) >= 2:
+            slope = float(np.polyfit(np.log([r["width"] for r in rungs]), levels, 1)[0])
+        if not any(sig_rungs):
+            verdict = "no significant win at any rung (effect within noise)"
+        elif all(sig_rungs) and slope is not None and slope < 0:
+            verdict = "significant win that grows with scale"
+        elif all(sig_rungs):
+            verdict = "significant win, flat/eroding with scale"
+        else:
+            verdict = "significant only at some rungs (mixed)"
+        trend[c] = {"gap_vs_logwidth_slope": slope, "levels": levels,
+                    "significant_rungs": sig_rungs, "verdict": verdict}
+        lv = " ".join(f"{g:+.4f}{'*' if s else ''}" for g, s in zip(levels, sig_rungs))
+        print(f"  [{name}] TREND {c}: levels {lv}  slope "
+              f"{('%.4f' % slope) if slope is not None else 'n/a'}  -> {verdict}")
     return trend
 
 
-def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candidates, out_json):
+def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candidates, out_json, seeds):
     """Resumable: each completed (pass, depth) rung is checkpointed to out_json; on a restart with the
-    same --tag, already-done rungs are skipped. Granularity is per-depth — an interrupted depth re-runs."""
-    print(f"\n########## ladder pass: {name} ##########")
+    same --tag, already-done rungs are skipped. Granularity is per-depth — an interrupted depth re-runs
+    its seeds, but each seed's harness call resumes from its own seed-specific file.
+
+    Multi-seed: the candidate gap is the PAIRED difference best_val(cand,s) - best_val(muon,s) averaged
+    over seeds (pairing cancels the per-seed common-mode noise); `gap` is the mean (keeps the key that
+    _fit_trend/make_figure read), with `gap_std`/`gap_seeds`/`n_seeds` for significance."""
+    print(f"\n########## ladder pass: {name}  (seeds {seeds}) ##########")
     pz = payload.setdefault(f"pass_{name}", {"iters_mode": name, "rungs": [], "trend": {}})
     done = {r["depth"] for r in pz["rungs"]}
     for d in depths:
@@ -134,32 +166,47 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
             continue
         it = iters_of(d)
         print(f"\n===== depth {d} (width {width(d)}, ~{nonembed_params(d)/1e6:.1f}M non-embed) "
-              f"x {it} iters =====")
-        sub_out = RESULTS_DIR / f"precond_{args.tag or 'default'}_{name}_d{d}.json"
-        res = run_harness(d, ",".join(arms_list), it, args.matrix_lr_grid,
-                          args.device_batch_size, args.max_seq_len, args.compile, sub_out)
-        arms = collect(res, arms_list)
+              f"x {it} iters x {len(seeds)} seed(s) =====")
+        per_seed = []  # collect()-style dict per seed
+        for s in seeds:
+            sub_out = RESULTS_DIR / f"precond_{args.tag or 'default'}_{name}_d{d}_s{s}.json"
+            res = run_harness(d, ",".join(arms_list), it, args.matrix_lr_grid,
+                              args.device_batch_size, args.max_seq_len, args.compile, sub_out, seed=s,
+                              synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho)
+            per_seed.append(collect(res, arms_list))
         rec = {"depth": d, "width": width(d), "nonembed_params": nonembed_params(d),
-               "iters": it, "arms": arms, "candidates": {}}
-        bmuon = arms[baseline]["best_val"]; wmuon = arms[baseline]["wall_s"]
+               "iters": it, "seeds": {s: per_seed[i] for i, s in enumerate(seeds)}, "candidates": {}}
+        # arms summary = seed-mean of best_val/wall_s (lr reported as the per-seed list)
+        rec["arms"] = {a: {"best_val": float(np.mean([ps[a]["best_val"] for ps in per_seed])),
+                           "wall_s": float(np.mean([ps[a]["wall_s"] for ps in per_seed])),
+                           "lr": [ps[a]["lr"] for ps in per_seed]} for a in arms_list}
         for c in candidates:
+            # gap on FINAL val (no best-checkpoint selection); paired per seed (cancels common-mode noise)
+            gaps = np.array([ps[c]["final_val"] - ps[baseline]["final_val"] for ps in per_seed])
+            over = np.array([(ps[c]["wall_s"] - ps[baseline]["wall_s"]) / ps[baseline]["wall_s"]
+                             for ps in per_seed])
+            gstd = float(gaps.std(ddof=1)) if len(gaps) > 1 else 0.0
+            sig = bool(len(gaps) > 1 and gaps.mean() < 0 and abs(gaps.mean()) > 2 * gstd)
             rec["candidates"][c] = {
-                "gap": arms[c]["best_val"] - bmuon,                 # <0 = candidate beats muon
-                "overhead": (arms[c]["wall_s"] - wmuon) / wmuon,    # per-sweep wall overhead
-                "lr": arms[c]["lr"], "muon_lr": arms[baseline]["lr"]}
+                "gap": float(gaps.mean()),                          # <0 = candidate beats baseline (seed-mean, FINAL val)
+                "gap_std": gstd, "gap_seeds": [float(g) for g in gaps], "n_seeds": len(gaps),
+                "significant": sig,   # beats baseline by >2 sigma over seeds — the ONLY thing we interpret
+                "overhead": float(over.mean()),                     # per-sweep wall overhead (seed-mean)
+                "lr": [ps[c]["lr"] for ps in per_seed], "muon_lr": [ps[baseline]["lr"] for ps in per_seed]}
         pz["rungs"].append(rec)
         pz["rungs"].sort(key=lambda r: r["depth"])
         _save(payload, out_json)  # checkpoint after each completed rung
         for c in candidates:
             cc = rec["candidates"][c]
-            print(f"  [{name}] d{d}: {c} gap {cc['gap']:+.4f}  overhead {cc['overhead']:+.1%}  "
-                  f"lr {cc['lr']} (muon {cc['muon_lr']})  [checkpointed]")
+            tg = "SIGNIF beats baseline (>2sigma)" if cc["significant"] else "NOT significant (within noise)"
+            print(f"  [{name}] d{d}: {c} gap {cc['gap']:+.4f} +/-{cc['gap_std']:.4f} (n={cc['n_seeds']}) "
+                  f"-> {tg}  overhead {cc['overhead']:+.1%}  [checkpointed]")
     pz["trend"] = _fit_trend(pz["rungs"], candidates, name)
     _save(payload, out_json)
 
 
-_CKPT_KEYS = ("depths", "arms", "matrix_lr_grid", "fixed_iters", "opt_max_iters",
-              "opt_min_iters", "device_batch_size", "max_seq_len")
+_CKPT_KEYS = ("depths", "arms", "matrix_lr_grid", "seeds", "fixed_iters", "opt_max_iters",
+              "opt_min_iters", "device_batch_size", "max_seq_len", "synth_alpha", "synth_ortho")
 
 
 def load_or_init(path, args, depths, baseline, candidates):
@@ -193,19 +240,31 @@ def load_or_init(path, args, depths, baseline, candidates):
 def batch_sweep(args, candidates, baseline, arms_list):
     if not args.batch_sweep.strip():
         return None
-    print(f"\n########## overhead-vs-batch probe (depth {args.batch_sweep_depth}) ##########")
+    print(f"\n########## gap-AND-overhead-vs-batch probe (depth {args.batch_sweep_depth}) ##########")
     out = []
     for bs in [int(x) for x in args.batch_sweep.split(",")]:
         sub_out = RESULTS_DIR / f"precond_{args.tag or 'default'}_batch{bs}.json"
         res = run_harness(args.batch_sweep_depth, ",".join(arms_list), args.batch_sweep_iters,
-                          args.matrix_lr_grid, bs, args.max_seq_len, args.compile, sub_out)
+                          args.matrix_lr_grid, bs, args.max_seq_len, args.compile, sub_out,
+                          synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho)
         arms = collect(res, arms_list)
-        wmuon = arms[baseline]["wall_s"]
+        wmuon = arms[baseline]["wall_s"]; bmuon = arms[baseline]["best_val"]
+        # record the val-loss GAP, not just overhead: the quality question is whether the
+        # candidate's advantage SURVIVES as batch grows and overhead amortizes toward 0.
         row = {"batch": bs, "tokens_per_step": bs * args.max_seq_len,
-               "overhead": {c: (arms[c]["wall_s"] - wmuon) / wmuon for c in candidates}}
+               "overhead": {c: (arms[c]["wall_s"] - wmuon) / wmuon for c in candidates},
+               "gap": {c: arms[c]["best_val"] - bmuon for c in candidates}}
         out.append(row)
         for c in candidates:
-            print(f"  batch {bs}: {c} overhead {row['overhead'][c]:+.1%}")
+            print(f"  batch {bs}: {c} gap {row['gap'][c]:+.4f}  overhead {row['overhead'][c]:+.1%}")
+    # headline: does the advantage survive at the largest (frontier) batch vs the smallest?
+    if len(out) >= 2:
+        lo, hi = out[0], out[-1]
+        for c in candidates:
+            print(f"  [batch] {c}: gap {lo['gap'][c]:+.4f} (batch {lo['batch']}) -> "
+                  f"{hi['gap'][c]:+.4f} (batch {hi['batch']}); overhead "
+                  f"{lo['overhead'][c]:+.1%} -> {hi['overhead'][c]:+.1%}  "
+                  f"-> {'advantage survives at frontier batch' if hi['gap'][c] <= 0 else 'advantage erodes at large batch'}")
     return out
 
 
@@ -224,9 +283,12 @@ def make_figure(payload, path):
         ws = [r["width"] for r in pz["rungs"]]
         for c in cands:
             g = [r["candidates"][c]["gap"] for r in pz["rungs"]]
+            gstd = [r["candidates"][c].get("gap_std", 0.0) for r in pz["rungs"]]
             o = [r["candidates"][c]["overhead"] for r in pz["rungs"]]
-            lr = [r["candidates"][c]["lr"] for r in pz["rungs"]]
-            ax[0].plot(ws, g, "o-", label=f"{c}/{pz['iters_mode']}")
+            # lr is a per-seed list per rung; plot the candidate's per-seed LRs (transfer = flat)
+            lr = [np.mean(r["candidates"][c]["lr"]) if isinstance(r["candidates"][c]["lr"], list)
+                  else r["candidates"][c]["lr"] for r in pz["rungs"]]
+            ax[0].errorbar(ws, g, yerr=gstd, fmt="o-", capsize=3, label=f"{c}/{pz['iters_mode']}")
             ax[1].plot(ws, o, "o-", label=f"{c}/{pz['iters_mode']}")
             ax[2].plot(ws, lr, "o-", label=f"{c}/{pz['iters_mode']}")
     ax[0].axhline(0, color="k", lw=0.7); ax[0].set_title("loss gap vs Muon (<0 better)")
@@ -243,6 +305,7 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
     depths = [int(x) for x in args.depths.split(",")]
     arms_list = args.arms.split(",")
+    seeds = [int(x) for x in args.seeds.split(",") if x.strip() != ""]
     baseline, candidates = arms_list[0], arms_list[1:]
     assert baseline == "muon", "first arm must be the muon baseline"
     max_depth = max(depths)
@@ -255,7 +318,7 @@ def main():
     for m in modes:
         iters_of = ((lambda d: args.fixed_iters) if m == "fixed"
                     else (lambda d: optimal_iters(d, max_depth, args)))
-        run_pass(payload, m, depths, iters_of, args, arms_list, baseline, candidates, out_json)
+        run_pass(payload, m, depths, iters_of, args, arms_list, baseline, candidates, out_json, seeds)
     if "batch_sweep" not in payload:
         payload["batch_sweep"] = batch_sweep(args, candidates, baseline, arms_list)
         _save(payload, out_json)
