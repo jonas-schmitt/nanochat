@@ -67,6 +67,8 @@ def parse_args():
     p.add_argument("--batch-sweep-iters", type=int, default=600)
     p.add_argument("--compile", action="store_true")
     p.add_argument("--tag", type=str, default="")
+    p.add_argument("--restart", action="store_true",
+                   help="ignore any existing checkpoint for this --tag and start fresh")
     return p.parse_args()
 
 
@@ -92,10 +94,37 @@ def optimal_iters(depth, max_depth, args):
     return max(args.opt_min_iters, round(args.opt_max_iters * r))
 
 
-def run_pass(name, depths, iters_of, args, arms_list, baseline, candidates):
+def _save(payload, path):
+    """Atomic checkpoint write (tmp + os.replace) so a stop mid-write never corrupts the file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=1))
+    os.replace(tmp, path)
+
+
+def _fit_trend(rungs, candidates, name):
+    trend = {}
+    if len(rungs) >= 2:
+        lw = np.log([r["width"] for r in rungs])
+        for c in candidates:
+            gaps = np.array([r["candidates"][c]["gap"] for r in rungs])
+            slope = float(np.polyfit(lw, gaps, 1)[0])
+            trend[c] = {"gap_vs_logwidth_slope": slope,
+                        "verdict": ("advantage grows with scale" if slope < 0
+                                    else "advantage erodes with scale")}
+            print(f"  [{name}] TREND {c}: d(gap)/d(log width) = {slope:+.4f}  -> {trend[c]['verdict']}")
+    return trend
+
+
+def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candidates, out_json):
+    """Resumable: each completed (pass, depth) rung is checkpointed to out_json; on a restart with the
+    same --tag, already-done rungs are skipped. Granularity is per-depth — an interrupted depth re-runs."""
     print(f"\n########## ladder pass: {name} ##########")
-    rungs = []
+    pz = payload.setdefault(f"pass_{name}", {"iters_mode": name, "rungs": [], "trend": {}})
+    done = {r["depth"] for r in pz["rungs"]}
     for d in depths:
+        if d in done:
+            print(f"  [resume] {name} d{d} already checkpointed — skipping")
+            continue
         it = iters_of(d)
         print(f"\n===== depth {d} (width {width(d)}, ~{nonembed_params(d)/1e6:.1f}M non-embed) "
               f"x {it} iters =====")
@@ -104,29 +133,45 @@ def run_pass(name, depths, iters_of, args, arms_list, baseline, candidates):
         arms = collect(res, arms_list)
         rec = {"depth": d, "width": width(d), "nonembed_params": nonembed_params(d),
                "iters": it, "arms": arms, "candidates": {}}
-        bmuon = arms[baseline]["best_val"]
-        wmuon = arms[baseline]["wall_s"]
+        bmuon = arms[baseline]["best_val"]; wmuon = arms[baseline]["wall_s"]
         for c in candidates:
             rec["candidates"][c] = {
                 "gap": arms[c]["best_val"] - bmuon,                 # <0 = candidate beats muon
                 "overhead": (arms[c]["wall_s"] - wmuon) / wmuon,    # per-sweep wall overhead
                 "lr": arms[c]["lr"], "muon_lr": arms[baseline]["lr"]}
-        rungs.append(rec)
+        pz["rungs"].append(rec)
+        pz["rungs"].sort(key=lambda r: r["depth"])
+        _save(payload, out_json)  # checkpoint after each completed rung
         for c in candidates:
             cc = rec["candidates"][c]
             print(f"  [{name}] d{d}: {c} gap {cc['gap']:+.4f}  overhead {cc['overhead']:+.1%}  "
-                  f"lr {cc['lr']} (muon {cc['muon_lr']})")
-    # trend fit: gap vs log(width) — slope sign is the headline
-    trend = {}
-    lw = np.log([r["width"] for r in rungs])
-    for c in candidates:
-        gaps = np.array([r["candidates"][c]["gap"] for r in rungs])
-        slope = float(np.polyfit(lw, gaps, 1)[0]) if len(rungs) > 1 else float("nan")
-        trend[c] = {"gap_vs_logwidth_slope": slope,
-                    "verdict": ("advantage grows with scale" if slope < 0
-                                else "advantage erodes with scale")}
-        print(f"  [{name}] TREND {c}: d(gap)/d(log width) = {slope:+.4f}  -> {trend[c]['verdict']}")
-    return {"iters_mode": name, "rungs": rungs, "trend": trend}
+                  f"lr {cc['lr']} (muon {cc['muon_lr']})  [checkpointed]")
+    pz["trend"] = _fit_trend(pz["rungs"], candidates, name)
+    _save(payload, out_json)
+
+
+_CKPT_KEYS = ("depths", "arms", "matrix_lr_grid", "fixed_iters", "opt_max_iters",
+              "opt_min_iters", "device_batch_size", "max_seq_len")
+
+
+def load_or_init(path, args, depths, baseline, candidates):
+    """Resume from an existing checkpoint for this --tag unless --restart or config changed."""
+    fresh = {"config": vars(args), "depths": depths, "baseline": baseline, "candidates": candidates}
+    if args.restart or not path.exists():
+        return fresh
+    try:
+        p = json.loads(path.read_text())
+    except Exception:
+        return fresh
+    old = p.get("config", {})
+    if [old.get(k) for k in _CKPT_KEYS] != [getattr(args, k) for k in _CKPT_KEYS]:
+        print("[resume] checkpoint config differs from current args — starting fresh "
+              "(use a new --tag to keep the old run)")
+        return fresh
+    done = {m: [r["depth"] for r in p.get(f"pass_{m}", {}).get("rungs", [])]
+            for m in ("fixed", "optimal") if f"pass_{m}" in p}
+    print(f"[resume] loaded {path.name}: completed rungs {done}")
+    return p
 
 
 def batch_sweep(args, candidates, baseline, arms_list):
@@ -185,17 +230,21 @@ def main():
     assert baseline == "muon", "first arm must be the muon baseline"
     max_depth = max(depths)
 
-    payload = {"config": vars(args), "depths": depths, "baseline": baseline, "candidates": candidates}
+    suffix = f"_{args.tag}" if args.tag else ""
+    out_json = RESULTS_DIR / f"scaling_ladder{suffix}.json"
+    payload = load_or_init(out_json, args, depths, baseline, candidates)
+
     modes = ["fixed", "optimal"] if args.mode == "both" else [args.mode]
     for m in modes:
         iters_of = ((lambda d: args.fixed_iters) if m == "fixed"
                     else (lambda d: optimal_iters(d, max_depth, args)))
-        payload[f"pass_{m}"] = run_pass(m, depths, iters_of, args, arms_list, baseline, candidates)
-    payload["batch_sweep"] = batch_sweep(args, candidates, baseline, arms_list)
+        run_pass(payload, m, depths, iters_of, args, arms_list, baseline, candidates, out_json)
+    if "batch_sweep" not in payload:
+        payload["batch_sweep"] = batch_sweep(args, candidates, baseline, arms_list)
+        _save(payload, out_json)
+    else:
+        print("[resume] batch_sweep already present — skipping")
 
-    suffix = f"_{args.tag}" if args.tag else ""
-    out_json = RESULTS_DIR / f"scaling_ladder{suffix}.json"
-    out_json.write_text(json.dumps(payload, indent=1))
     make_figure(payload, RESULTS_DIR / f"scaling_ladder{suffix}.png")
     print(f"\n[saved] {out_json}")
     for m in modes:

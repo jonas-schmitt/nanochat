@@ -49,7 +49,44 @@ def parse_args():
     p.add_argument("--n-steps", type=int, default=5)
     p.add_argument("--compile", action="store_true")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--restart", action="store_true",
+                   help="ignore any existing checkpoint and start the search fresh")
     return p.parse_args()
+
+
+OUT_CKPT = OUT.with_suffix(".ckpt.json")
+_SEARCH_KEYS = ("depth_small", "depth_large", "eval_iters", "n_steps", "pop", "lambda_slope",
+                "matrix_lr", "seed")
+
+
+def _save_ckpt(state):
+    """Atomic per-generation checkpoint so the search can be stopped and resumed (same OUT --tag)."""
+    tmp = OUT_CKPT.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    os.replace(tmp, OUT_CKPT)
+
+
+def _ser_cache(cache):
+    return {f"{d},{i}": v for (d, i), v in cache.items()}
+
+
+def _deser_cache(d):
+    return {tuple(int(x) for x in k.split(",")): v for k, v in d.items()}
+
+
+def load_ckpt(args):
+    if args.restart or not OUT_CKPT.exists():
+        return None
+    try:
+        s = json.loads(OUT_CKPT.read_text())
+    except Exception:
+        return None
+    old = s.get("config", {})
+    if [old.get(k) for k in _SEARCH_KEYS] != [getattr(args, k) for k in _SEARCH_KEYS]:
+        print("[resume] search checkpoint config differs from current args — starting fresh")
+        return None
+    print(f"[resume] loaded {OUT_CKPT.name}: {s['gen_done'] + 1} generation(s) done")
+    return s
 
 
 # ---------------------------- grammar (width-covariant prior) ----------------------------
@@ -166,14 +203,22 @@ def main():
     args = parse_args()
     sys.stdout.reconfigure(line_buffering=True)
     rng = np.random.default_rng(args.seed)
-    muon_cache = {}
-    # prime the two fitness baselines up front
-    muon_baseline(args, args.depth_small, args.eval_iters, muon_cache)
-    muon_baseline(args, args.depth_large, args.eval_iters, muon_cache)
+    ck = load_ckpt(args)
+    if ck:  # resume
+        muon_cache = _deser_cache(ck["muon_cache"])
+        pop = [([tuple(t) for t in tr], list(pr)) for tr, pr in ck["population"]]
+        history = ck["history"]
+        best = (ck["best"][0], ([tuple(t) for t in ck["best"][1][0]], ck["best"][1][1])) if ck["best"] else None
+        start_gen = ck["gen_done"] + 1
+        rng.bit_generator.state = ck["rng_state"]
+    else:  # fresh — prime the two fitness baselines, seed from cubic NS + Muon quintic
+        muon_cache = {}
+        muon_baseline(args, args.depth_small, args.eval_iters, muon_cache)
+        muon_baseline(args, args.depth_large, args.eval_iters, muon_cache)
+        pop = seed_population(args.n_steps, args.pop, rng)
+        history, best, start_gen = [], None, 0
 
-    pop = seed_population(args.n_steps, args.pop, rng)  # start from cubic NS + Muon quintic
-    history, best = [], None
-    for gen in range(args.gens):
+    for gen in range(start_gen, args.gens):
         scored = []
         for sched in pop:
             F, info = fitness(sched, args, muon_cache)
@@ -188,6 +233,10 @@ def main():
         elites = [s for _, s in scored[: max(2, args.pop // 4)]]
         pop = elites + [mutate(elites[int(rng.integers(len(elites)))], rng)
                         for _ in range(args.pop - len(elites))]
+        _save_ckpt({"config": vars(args), "gen_done": gen, "population": pop, "history": history,
+                    "best": best, "muon_cache": _ser_cache(muon_cache),
+                    "rng_state": rng.bit_generator.state})
+        print(f"[checkpoint] gen {gen} saved -> {OUT_CKPT.name}")
 
     # gates on the winner: horizon transfer + scale transfer
     print("\n=== gates on winner ===")
