@@ -1,4 +1,12 @@
-"""③ (scalability moonshot) — search a polar Newton–Schulz schedule that SCALES better than Muon.
+"""DEPRECATED (2026-06-25) — superseded by the real typed-grammar search.
+
+This was a flat coefficient GA over polar (a,b,c) triples. The moonshot now uses the existing typed
+grammar + NSGA-II in gns (`gns.search.nsga2` over `gns.coupled_grammar`, driven by
+`gns/experiments/exp28_coupled_regime_zoo.py`) scored by the exact scalar surrogate, with grammar
+schedules injected into training via the harness `--precond-coupled-orders` flag and evaluated by
+`scaling_ladder.py`. Kept for provenance; do not extend.
+
+③ (scalability moonshot) — search a polar Newton–Schulz schedule that SCALES better than Muon.
 
 Single-scale loss is the wrong objective: a schedule that wins at d6 tells you ~nothing about d=16384
 and often anti-correlates with scale. So fitness here is a SCALABILITY proxy — each candidate is judged
