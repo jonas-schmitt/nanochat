@@ -37,6 +37,8 @@ HARNESS = str(Path(__file__).resolve().parent / "train_compare_precond.py")
 HARNESS_OUT = Path("/home/jonas/git/gns/results/precond_train_compare.json")
 RESULTS_DIR = Path("/home/jonas/git/gns/results")
 ASPECT, HEAD_DIM = 64, 128  # must match train_compare_precond.build_model
+# one-sided 97.5% Student-t critical values by dof (n-1); ~2 sigma with small-sample correction
+_TCRIT = {1: 12.71, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262}
 
 
 def width(depth: int) -> int:
@@ -139,9 +141,9 @@ def _fit_trend(rungs, candidates, name):
         if not any(sig_rungs):
             verdict = "no significant win at any rung (effect within noise)"
         elif all(sig_rungs) and slope is not None and slope < 0:
-            verdict = "significant win that grows with scale"
+            verdict = "significant win at every rung; negative scaling slope (trend, slope-CI not established)"
         elif all(sig_rungs):
-            verdict = "significant win, flat/eroding with scale"
+            verdict = "significant win at every rung; slope flat/positive"
         else:
             verdict = "significant only at some rungs (mixed)"
         trend[c] = {"gap_vs_logwidth_slope": slope, "levels": levels,
@@ -189,12 +191,20 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
             gaps = np.array([ps[c]["final_val"] - ps[baseline]["final_val"] for ps in per_seed])
             over = np.array([(ps[c]["wall_s"] - ps[baseline]["wall_s"]) / ps[baseline]["wall_s"]
                              for ps in per_seed])
-            gstd = float(gaps.std(ddof=1)) if len(gaps) > 1 else 0.0
-            sig = bool(len(gaps) > 1 and gaps.mean() < 0 and abs(gaps.mean()) > 2 * gstd)
+            n = len(gaps); gmean = float(gaps.mean())
+            gstd = float(gaps.std(ddof=1)) if n > 1 else 0.0
+            sem = gstd / np.sqrt(n) if n > 1 and gstd > 0 else float("inf")
+            tstat = gmean / sem if np.isfinite(sem) and sem > 0 else 0.0
+            # one-sided t-test that the paired mean gap is < 0 (candidate beats baseline). This is the
+            # rigorous "2 sigma" significance (uncertainty of the MEAN, small-sample t-critical), not an
+            # effect-size |mean|>2*SD which would reject real p~0.01 effects.
+            sig = bool(n > 1 and gmean < 0 and tstat < -_TCRIT.get(n - 1, 2.0))
             rec["candidates"][c] = {
-                "gap": float(gaps.mean()),                          # <0 = candidate beats baseline (seed-mean, FINAL val)
-                "gap_std": gstd, "gap_seeds": [float(g) for g in gaps], "n_seeds": len(gaps),
-                "significant": sig,   # beats baseline by >2 sigma over seeds — the ONLY thing we interpret
+                "gap": gmean,                                       # <0 = candidate beats baseline (seed-mean, FINAL val)
+                "gap_std": gstd, "gap_sem": (gstd / np.sqrt(n) if n > 1 else None),
+                "t_stat": tstat, "t_crit": _TCRIT.get(n - 1, 2.0),
+                "gap_seeds": [float(g) for g in gaps], "n_seeds": n,
+                "significant": sig,   # one-sided t-test mean<0 at ~95% — the ONLY thing we interpret
                 "overhead": float(over.mean()),                     # per-sweep wall overhead (seed-mean)
                 "lr": [ps[c]["lr"] for ps in per_seed], "muon_lr": [ps[baseline]["lr"] for ps in per_seed]}
         pz["rungs"].append(rec)
@@ -230,9 +240,12 @@ def load_or_init(path, args, depths, baseline, candidates):
         raise SystemExit(f"[abort] checkpoint {path} is unreadable/corrupt ({e}). "
                          f"Pass --restart to discard it, or use a different --tag.")
     old = p.get("config", {})
-    if [old.get(k) for k in _CKPT_KEYS] != [getattr(args, k) for k in _CKPT_KEYS]:
-        raise SystemExit(f"[abort] checkpoint {path.name} config differs from current args "
-                         f"(would mix incompatible runs). Use a new --tag, or --restart to discard.")
+    # backward-compatible: only abort on keys that EXIST in the old checkpoint and actually differ;
+    # knobs added to the code after the checkpoint was written are tolerated (their default applies).
+    diffs = [k for k in _CKPT_KEYS if k in old and old[k] != getattr(args, k)]
+    if diffs:
+        raise SystemExit(f"[abort] checkpoint {path.name} config differs on {diffs} (would mix "
+                         f"incompatible runs). Use a new --tag, or --restart to discard.")
     tmp = path.with_suffix(path.suffix + ".tmp")  # clear stale tmp from a prior crash mid-write
     if tmp.exists():
         tmp.unlink()
