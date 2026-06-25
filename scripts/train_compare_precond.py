@@ -90,6 +90,10 @@ def parse_args():
     p.add_argument("--precond-coupled-orders", type=str, default="",
                    help="grammar-searched CoupledStep order sequence (e.g. '3,2,2,1') used for the "
                         "Shampoo inverse-root instead of the uniform 24-step chain; empty = default.")
+    p.add_argument("--soap-refresh-every", type=int, default=50,
+                   help="SOAP eigenbasis refresh interval (steps). Must be >> Shampoo's recompute (10) so "
+                        "the in-basis Adam second moment can adapt in a stable basis.")
+    p.add_argument("--soap-beta2", type=float, default=0.99, help="SOAP second-moment EMA (Adam-typical).")
     p.add_argument("--n-val-batches", type=int, default=16)
     p.add_argument("--eval-every", type=int, default=50)
     p.add_argument("--arms", type=str, default="muon,shampoo,ortho_shampoo,layer_adaptive,sgd")
@@ -249,7 +253,7 @@ def _soap_step(p, st, lr, args, eps=1e-8):
     if st["msoap"] is None or st["msoap"].shape != ghat.shape:
         st["msoap"] = torch.zeros_like(ghat); st["vsoap"] = torch.zeros_like(ghat)
     st["msoap"].mul_(args.momentum).add_(ghat, alpha=1 - args.momentum)
-    st["vsoap"].mul_(args.beta2).add_(ghat * ghat, alpha=1 - args.beta2)
+    st["vsoap"].mul_(args.soap_beta2).add_(ghat * ghat, alpha=1 - args.soap_beta2)
     phat = st["msoap"] / (st["vsoap"].sqrt() + eps)
     D = (QL @ phat @ QR.t()) if QL is not None else phat   # rotate back
     p.sub_((lr * D).to(p.dtype))
@@ -319,7 +323,8 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                     st["L"].mul_(args.shampoo_beta).add_(gf @ gf.t(), alpha=1 - args.shampoo_beta)
                     st["R"].mul_(args.shampoo_beta).add_(gf.t() @ gf, alpha=1 - args.shampoo_beta)
                     fresh = (st["Q_L"] is None) if arm == "soap" else (st["Linv"] is None)
-                    if step >= args.warmup_steps and (fresh or step % args.shampoo_recompute_every == 0):
+                    recompute_n = args.soap_refresh_every if arm == "soap" else args.shampoo_recompute_every
+                    if step >= args.warmup_steps and (fresh or step % recompute_n == 0):
                         if arm == "soap":
                             _soap_refresh_basis(st)
                         else:
