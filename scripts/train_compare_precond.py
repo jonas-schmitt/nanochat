@@ -229,6 +229,32 @@ def _synth_dir(gm, st, args):
     return polar_express_orth(D, args.ns_steps) if args.synth_ortho else D
 
 
+# ----------------------------- SOAP: Adam in the Kronecker eigenbasis -----------------------------
+def _soap_refresh_basis(st):
+    """Recompute the factor eigenbases Q_L,Q_R and rotate the in-basis momentum to stay aligned
+    (the first moment is gradient-covariant; the per-element second moment re-adapts in the new basis)."""
+    QLn = torch.linalg.eigh(0.5 * (st["L"] + st["L"].t())).eigenvectors
+    QRn = torch.linalg.eigh(0.5 * (st["R"] + st["R"].t())).eigenvectors
+    if st["Q_L"] is not None and st["msoap"] is not None:
+        RL = QLn.t() @ st["Q_L"]; RR = st["Q_R"].t() @ QRn   # old-basis -> new-basis rotation
+        st["msoap"] = RL @ st["msoap"] @ RR
+    st["Q_L"], st["Q_R"] = QLn, QRn
+
+
+def _soap_step(p, st, lr, args, eps=1e-8):
+    """SOAP update: rotate g into the eigenbasis, run Adam there, rotate back. Bypasses NorMuon."""
+    g = p.grad.float()
+    QL, QR = st["Q_L"], st["Q_R"]
+    ghat = (QL.t() @ g @ QR) if QL is not None else g     # identity basis before the first refresh
+    if st["msoap"] is None or st["msoap"].shape != ghat.shape:
+        st["msoap"] = torch.zeros_like(ghat); st["vsoap"] = torch.zeros_like(ghat)
+    st["msoap"].mul_(args.momentum).add_(ghat, alpha=1 - args.momentum)
+    st["vsoap"].mul_(args.beta2).add_(ghat * ghat, alpha=1 - args.beta2)
+    phat = st["msoap"] / (st["vsoap"].sqrt() + eps)
+    D = (QL @ phat @ QR.t()) if QL is not None else phat   # rotate back
+    p.sub_((lr * D).to(p.dtype))
+
+
 def direction(arm, p, st, grad, args, step):
     gm = _nesterov(grad, st, args.momentum)
     use_precond = step >= args.warmup_steps and st.get("Linv") is not None
@@ -269,8 +295,9 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
     state = [{"mom": torch.zeros_like(p), "v2": None,
               "L": torch.zeros(p.shape[0], p.shape[0], device=device),
               "R": torch.zeros(p.shape[1], p.shape[1], device=device),
-              "Linv": None, "Rinv": None, "kappa": 1.0} for p in mp]
-    needs_factors = arm in ("shampoo", "ortho_shampoo", "layer_adaptive", "synth")
+              "Linv": None, "Rinv": None, "kappa": 1.0,
+              "Q_L": None, "Q_R": None, "msoap": None, "vsoap": None} for p in mp]
+    needs_factors = arm in ("shampoo", "ortho_shampoo", "layer_adaptive", "synth", "soap")
 
     log = {"step": [], "val": [], "wall_ms": []}
     ev_start = torch.cuda.Event(enable_timing=True); ev_start.record()
@@ -291,15 +318,21 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                     gf = p.grad.float()
                     st["L"].mul_(args.shampoo_beta).add_(gf @ gf.t(), alpha=1 - args.shampoo_beta)
                     st["R"].mul_(args.shampoo_beta).add_(gf.t() @ gf, alpha=1 - args.shampoo_beta)
-                    if step >= args.warmup_steps and (st["Linv"] is None
-                                                      or step % args.shampoo_recompute_every == 0):
-                        st["Linv"] = inv_fourth_root(st["L"], args.shampoo_ridge, args.shampoo_coupled_steps, orders=args._precond_orders)
-                        st["Rinv"] = inv_fourth_root(st["R"], args.shampoo_ridge, args.shampoo_coupled_steps, orders=args._precond_orders)
-                        if arm == "layer_adaptive":
-                            st["kappa"] = max(_kappa_proxy(st["L"]), _kappa_proxy(st["R"]))
-                        if arm == "synth":
-                            st["Linv_a"] = _spd_power(st["Linv"], args.synth_alpha)
-                            st["Rinv_a"] = _spd_power(st["Rinv"], args.synth_alpha)
+                    fresh = (st["Q_L"] is None) if arm == "soap" else (st["Linv"] is None)
+                    if step >= args.warmup_steps and (fresh or step % args.shampoo_recompute_every == 0):
+                        if arm == "soap":
+                            _soap_refresh_basis(st)
+                        else:
+                            st["Linv"] = inv_fourth_root(st["L"], args.shampoo_ridge, args.shampoo_coupled_steps, orders=args._precond_orders)
+                            st["Rinv"] = inv_fourth_root(st["R"], args.shampoo_ridge, args.shampoo_coupled_steps, orders=args._precond_orders)
+                            if arm == "layer_adaptive":
+                                st["kappa"] = max(_kappa_proxy(st["L"]), _kappa_proxy(st["R"]))
+                            if arm == "synth":
+                                st["Linv_a"] = _spd_power(st["Linv"], args.synth_alpha)
+                                st["Rinv_a"] = _spd_power(st["Rinv"], args.synth_alpha)
+                if arm == "soap":   # Adam in the eigenbasis; bypasses NorMuon, own Adam-range LR
+                    _soap_step(p, st, lr * lrm, args)
+                    continue
                 D = direction(arm, p, st, p.grad, args, step)
                 if not torch.isfinite(D).all():
                     D = _nesterov(p.grad, st, args.momentum)  # robustness fallback

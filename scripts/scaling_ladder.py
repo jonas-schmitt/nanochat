@@ -80,6 +80,8 @@ def parse_args():
     p.add_argument("--synth-ortho", type=int, default=1, help="passed to the harness synth arm")
     p.add_argument("--precond-coupled-orders", type=str, default="",
                    help="grammar CoupledStep order sequence passed to the harness inverse-root")
+    p.add_argument("--shampoo-ridge", type=str, default="",
+                   help="harness shampoo-ridge (effective shrinkage); empty = harness default 1e-4")
     p.add_argument("--tag", type=str, default="")
     p.add_argument("--restart", action="store_true",
                    help="ignore any existing checkpoint for this --tag and start fresh")
@@ -87,7 +89,7 @@ def parse_args():
 
 
 def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path, seed=0,
-                synth_alpha=1.0, synth_ortho=1, precond_orders=""):
+                synth_alpha=1.0, synth_ortho=1, precond_orders="", shampoo_ridge=""):
     # unique per-call --out (race-free) that the harness ALSO checkpoints per (arm,lr) to, so a driver
     # restart resumes a half-done depth instead of recomputing it. The harness resume signature includes
     # seed, so a seed-specific out_path resumes each seed independently.
@@ -96,6 +98,8 @@ def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path, seed=
            "--max-seq-len", str(seq), "--seed", str(seed), "--synth-alpha", str(synth_alpha),
            "--synth-ortho", str(synth_ortho), "--precond-coupled-orders", precond_orders,
            "--out", str(out_path)]
+    if shampoo_ridge:
+        cmd += ["--shampoo-ridge", str(shampoo_ridge)]
     if compile_:
         cmd.append("--compile")
     env = {**os.environ, "PYTHONPATH": "/home/jonas/git/nanochat:/home/jonas/git/gns/src"}
@@ -178,7 +182,7 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
             res = run_harness(d, ",".join(arms_list), it, args.matrix_lr_grid,
                               args.device_batch_size, args.max_seq_len, args.compile, sub_out, seed=s,
                               synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho,
-                              precond_orders=args.precond_coupled_orders)
+                              precond_orders=args.precond_coupled_orders, shampoo_ridge=args.shampoo_ridge)
             per_seed.append(collect(res, arms_list))
         rec = {"depth": d, "width": width(d), "nonembed_params": nonembed_params(d),
                "iters": it, "seeds": {s: per_seed[i] for i, s in enumerate(seeds)}, "candidates": {}}
@@ -221,7 +225,7 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
 
 _CKPT_KEYS = ("depths", "arms", "matrix_lr_grid", "seeds", "fixed_iters", "opt_max_iters",
               "opt_min_iters", "device_batch_size", "max_seq_len", "synth_alpha", "synth_ortho",
-              "precond_coupled_orders")
+              "precond_coupled_orders", "shampoo_ridge")
 
 
 def load_or_init(path, args, depths, baseline, candidates):
@@ -265,7 +269,7 @@ def batch_sweep(args, candidates, baseline, arms_list):
         res = run_harness(args.batch_sweep_depth, ",".join(arms_list), args.batch_sweep_iters,
                           args.matrix_lr_grid, bs, args.max_seq_len, args.compile, sub_out,
                           synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho,
-                          precond_orders=args.precond_coupled_orders)
+                          precond_orders=args.precond_coupled_orders, shampoo_ridge=args.shampoo_ridge)
         arms = collect(res, arms_list)
         wmuon = arms[baseline]["wall_s"]; bmuon = arms[baseline]["best_val"]
         # record the val-loss GAP, not just overhead: the quality question is whether the
