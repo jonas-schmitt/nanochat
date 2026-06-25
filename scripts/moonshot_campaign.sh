@@ -27,6 +27,13 @@ stage gateA_curv  --depths 8     --fixed-iters 1500 --matrix-lr-grid 0.02 --arms
 stage camp_curv   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 stage camp_gram   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,3,3,2,3,3,3,3
 
+# ===== A-alloc — per-factor kappa allocation (the moonshot's CENTRAL differentiator: incumbents are all
+#       UNIFORM; route curvature only onto high-kappa factors via the kappa-proxy gate, default thr 1e4).
+#       The wide MLP c_fc/c_proj factors are the kappa~1e6 monsters and their share GROWS with depth (G0),
+#       so this is the most direct test of "heterogeneity recovers the d12 gap". Compare its gap to
+#       camp_curv's ortho_shampoo (same depths/lr/iters) = uniform-curvature reference. =================
+stage layer_adapt --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,layer_adaptive
+
 # ===== A1 — batch x scale (DECISIVE): does curvature win grow with batch at d12? (LR scaled ~sqrt(bs/16))
 stage batch16   --depths 8,12 --device-batch-size 16  --fixed-iters 1500 --matrix-lr-grid 0.02  --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 stage batch64   --depths 8,12 --device-batch-size 64  --fixed-iters 1500 --matrix-lr-grid 0.04  --arms muon,ortho_shampoo,synth --synth-alpha 0.5

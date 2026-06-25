@@ -79,6 +79,16 @@ def main():
         for c, cc in r["candidates"].items():
             line(f"d12_long d{r['depth']} {c}", cc)
 
+    print("\n========== A-alloc — per-factor kappa allocation (layer_adaptive vs muon) ==========")
+    print("    (compare to camp_curv ortho_shampoo at the same depth = uniform-curvature reference)")
+    for r in sorted(rungs("layer_adapt") or [], key=lambda r: r["depth"]):
+        for c, cc in r["candidates"].items():
+            line(f"layer_adapt d{r['depth']} {c}", cc)
+    for r in sorted(rungs("camp_curv") or [], key=lambda r: r["depth"]):
+        for c, cc in r["candidates"].items():
+            if c == "ortho_shampoo":
+                line(f"[ref] camp_curv d{r['depth']} {c}", cc)
+
 
 if __name__ == "__main__":
     main()
