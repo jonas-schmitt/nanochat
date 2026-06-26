@@ -39,7 +39,7 @@ stage1(){ local tag="$1"; shift
 # ===== prior moonshot stages (3-seed; resume/finalise in seconds) =====================================
 stage3 gateA_curv  --depths 8     --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 stage3 camp_curv   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-stage3 camp_gram   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,3,3,2,3,3,3,3
+stage3 camp_gram   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
 # A-alloc (DONE/falsified 2026-06-26): per-factor kappa allocation underperformed even uniform curvature
 # at d12 (gap +0.0091, worse than Muon). Kept for provenance/verification on resume.
 stage3 layer_adapt --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,layer_adaptive
