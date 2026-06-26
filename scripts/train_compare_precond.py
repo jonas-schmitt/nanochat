@@ -415,9 +415,12 @@ def main():
     if out_path.exists():
         try:
             prev = json.loads(out_path.read_text()); pc = prev.get("config", {})
+            # resume: reuse completed (arm,lr) sub-runs from a prior partial run of THIS out file.
+            # Backward-compatible: a key ABSENT from an old checkpoint defaults to the current value
+            # (so adding --orth-every does not re-run pre-existing 3-seed work that never had it).
             sig = ("depth", "seed", "arms", "matrix_lr_grid", "num_iterations", "device_batch_size",
-               "orth_every")
-            if [pc.get(k) for k in sig] == [cfg[k] for k in sig]:
+                   "orth_every", "aspect_ratio")
+            if [pc.get(k, cfg[k]) for k in sig] == [cfg[k] for k in sig]:
                 done = prev.get("_done", {})
                 if done:
                     print(f"[resume] {out_path.name}: {len(done)} (arm,lr) sub-runs already complete")
