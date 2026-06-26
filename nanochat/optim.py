@@ -97,6 +97,12 @@ def polar_express_orth(g: Tensor, ns_steps: int) -> Tensor:
     bf16 for speed when available; skip otherwise (fp16 is unstable here due to limited
     exponent range)."""
     X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    # The 1.01 safety factor overscales the divisor so the iterate enters the
+    # polynomial slightly below 1 (DESIGN.md convention 4); the +1e-6 floor is a
+    # numerical guard for degenerate zero-matrix slices (e.g. a param with no
+    # gradient on a step) that would otherwise give 0/0 -> NaN. Negligible for any
+    # well-conditioned matrix (||X||_F >> 1e-6), so it does not perturb the
+    # scalar-map / executor agreement (V1, sanity_muon_orth).
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
     if g.size(-2) > g.size(-1): # Tall matrix
         for a, b, c in polar_express_coeffs[:ns_steps]:

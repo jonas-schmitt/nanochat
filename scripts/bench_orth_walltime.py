@@ -6,7 +6,7 @@ question: does a precision-aware GNS schedule reach lower wall-clock than the bf
 on tier-2 Blackwell? Reproduces exp10's mechanism (1.30x on RTX 4070) on the GB10.
 
 Run: PYTHONPATH=/home/jonas/git/nanochat:/home/jonas/git/gns/src \
-     /home/jonas/git/tct-models/.venv/bin/python scripts/bench_orth_walltime.py
+     uv run --project /path/to/tct-models python scripts/bench_orth_walltime.py
 """
 import os, sys, time, json
 import torch
@@ -19,8 +19,11 @@ from nanochat.muon_schedules import build_registry, set_fp8_real
 # relative orthogonalization cost on real GB10 fp8 matmuls; they are NOT end-to-end training
 # wall-clock (that needs the batched fused kernel, not yet built — see TODO Open questions).
 assert torch.cuda.is_available(), "need the GB10"
-real = set_fp8_real(True)
-print(f"fp8 real (_scaled_mm) available/enabled: {real}", flush=True)
+_cap = torch.cuda.get_device_capability(0)
+_fp8_capable = _cap[0] >= 89  # fp8 _scaled_mm requires sm_89+ (Ada/Hopper/Blackwell)
+real = set_fp8_real(True) if _fp8_capable else False
+print(f"GPU: {torch.cuda.get_device_name(0)} (sm_{_cap[0]}{_cap[1]}); "
+      f"fp8 real (_scaled_mm) available/enabled: {real}", flush=True)
 DEV = "cuda"
 NS = int(os.environ.get("BENCH_NS", "5"))
 SHAPES = [(4096, 4096), (2048, 8192), (8192, 2048)]

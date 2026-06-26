@@ -2,11 +2,13 @@
 
 Every arm shares Muon's EXACT post-direction machinery — Nesterov momentum, NorMuon variance
 reduction, and cautious weight decay/update (lifted from nanochat.optim.muon_step_unfused) — and
-varies ONLY the matrix DIRECTION map D(g, state). So the `muon` arm is the real SOTA Muon (not bare
-polar + an RMS-norm hack), and every other arm is judged against it on equal footing.
+varies ONLY the matrix DIRECTION map D(g, state). The `muon` arm uses production-matched Muon
+hyperparameters (beta2=0.9, weight_decay=0.28 cosine-annealed) so that every other arm is judged
+against the real SOTA Muon baseline on equal footing.
 
 Direction maps:
-  sgd            : D = nesterov(g)                                        (no-precond floor)
+  sgd            : D = nesterov(g) then NorMuon + cautious WD (no polar
+                   orthogonalization — NOT vanilla SGD, this is Muon-without-orth)
   muon           : D = polar_express_orth(nesterov(g))                    (SOTA baseline)
   shampoo        : D = L^(-1/4) @ nesterov(g) @ R^(-1/4)                  (Shampoo via gns.coupled)
   ortho_shampoo  : D = polar_express_orth( L^(-1/4) g R^(-1/4) )          (① curvature dir + Muon robustness)
@@ -26,6 +28,7 @@ Run (tct-models env + gns on path):
 """
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -71,8 +74,8 @@ def parse_args():
     p.add_argument("--matrix-lr-grid", type=str, default="0.02")
     p.add_argument("--adam-lr", type=float, default=3e-3)
     p.add_argument("--momentum", type=float, default=0.95)
-    p.add_argument("--beta2", type=float, default=0.95)          # NorMuon second-moment EMA
-    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--beta2", type=float, default=0.9)           # NorMuon second-moment EMA (production Muon)
+    p.add_argument("--weight-decay", type=float, default=0.28)   # production Muon cautious WD (cosine-annealed)
     p.add_argument("--ns-steps", type=int, default=5)
     p.add_argument("--orth-every", type=int, default=1,
                    help="apply the polar/preconditioner direction map only every K steps; on off-steps "
@@ -141,10 +144,18 @@ def build_model(args, vocab_size, device, seed):
     return model, model_dim
 
 
+# Minimum dimension for a matrix to go through the Muon orthogonalization path.
+# Tiny gate matrices (e.g. ve_gate at 12×n_kv_head) have too few samples for stable
+# NorMuon variance reduction and no theoretical justification for orthogonalization.
+# Production gpt.py groups by shape and the MuonAdamW docstring warns against applying
+# Muon to embeddings/final-FC/small matrices. Matrices below this threshold go to AdamW.
+MIN_MUON_DIM = 32
+
+
 def matrix_params(model):
     # robust to a torch.compile OptimizedModule wrapper (params live on _orig_mod)
     m = getattr(model, "_orig_mod", model)
-    return [p for p in m.transformer.h.parameters() if p.dim() == 2]
+    return [p for p in m.transformer.h.parameters() if p.dim() == 2 and min(p.shape) >= MIN_MUON_DIM]
 
 
 # ----------------------------- coupled inverse 1/4-root -----------------------------
@@ -160,7 +171,15 @@ def _power_iter_max(L, iters=18):
 
 def _kappa_proxy(L, lam_max=None):
     """Cheap condition-number proxy: lam_max / lam_min via two power-iteration sequences
-    (the second on (lam_max I - L) gives lam_max - lam_min). Eigendecomposition-free."""
+    (the second on (lam_max I - L) gives lam_max - lam_min). Eigendecomposition-free.
+
+    Limitations: the proxy is NUMERICALLY ROBUST (power iteration is stable) but NOT
+    TIGHT — (1) only 18 power iters means lam_max/lam_min are approximate (especially
+    lam_min via the shifted gap, which amplifies error when the spectrum is clustered);
+    (2) the lam_min floor `lam_max * 1e-12` caps the reported kappa at 1e12, hiding
+    true ill-conditioning beyond that; (3) it is per-factor (L or R alone), not the
+    true Kronecker condition number. Sufficient for layer_adaptive routing (a coarse
+    threshold gate), not for quantitative conditioning claims."""
     Ls = 0.5 * (L + L.t())
     lam_max = _power_iter_max(Ls) if lam_max is None else lam_max
     if not (lam_max > 0 and np.isfinite(lam_max)):
@@ -244,9 +263,14 @@ def _soap_refresh_basis(st):
     (the first moment is gradient-covariant; the per-element second moment re-adapts in the new basis)."""
     QLn = torch.linalg.eigh(0.5 * (st["L"] + st["L"].t())).eigenvectors
     QRn = torch.linalg.eigh(0.5 * (st["R"] + st["R"].t())).eigenvectors
-    if st["Q_L"] is not None and st["msoap"] is not None:
-        RL = QLn.t() @ st["Q_L"]; RR = st["Q_R"].t() @ QRn   # old-basis -> new-basis rotation
-        st["msoap"] = RL @ st["msoap"] @ RR
+    if st["msoap"] is not None:
+        if st["Q_L"] is not None:
+            # subsequent refresh: rotate from old eigenbasis to new
+            RL = QLn.t() @ st["Q_L"]; RR = st["Q_R"].t() @ QRn
+            st["msoap"] = RL @ st["msoap"] @ RR
+        else:
+            # first refresh: msoap accumulated in identity basis (Q_old = I), rotate to new
+            st["msoap"] = QLn.t() @ st["msoap"] @ QRn
     st["Q_L"], st["Q_R"] = QLn, QRn
 
 
@@ -352,7 +376,9 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                 D = direction(arm, p, st, p.grad, args, step)
                 if not torch.isfinite(D).all():
                     D = _nesterov(p.grad, st, args.momentum)  # robustness fallback
-                apply_norm_caution_update(D, p, st, lr * lrm, args.weight_decay, args.beta2)
+                # Cosine-annealed weight decay (matching production base_train.py:get_weight_decay)
+                cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / args.num_iterations))
+                apply_norm_caution_update(D, p, st, lr * lrm, cos_wd, args.beta2)
         for gpar in adam.param_groups:
             gpar["lr"] = args.adam_lr * lrm
         adam.step()

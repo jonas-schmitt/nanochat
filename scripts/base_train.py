@@ -383,13 +383,17 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown_iters:
         return 1.0
     else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        warmdown_start = num_iterations - warmdown_iters
+        progress = (it - warmdown_start) / max(1, warmdown_iters - 1)
+        return (1 - progress) * 1.0 + progress * args.final_lr_frac
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     warmdown_start = num_iterations - warmdown_iters
+    # NOTE: the 400-step momentum warmup is HARDCODED here and independent of
+    # --warmup-steps (which only governs the LR warmup). Do not assume changing
+    # --warmup-steps changes the momentum ramp length.
     if it < 400:
         frac = it / 400
         return (1 - frac) * 0.85 + frac * 0.97

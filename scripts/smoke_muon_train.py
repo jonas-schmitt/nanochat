@@ -5,7 +5,7 @@ Validates that setup_optimizer(muon_orth=...) and the eager pluggable Muon path 
 inside a real GPT training loop on the actual matrix-parameter shapes, on this device.
 
 Run: PYTHONPATH=/home/jonas/git/nanochat:/home/jonas/git/gns/src \
-     /home/jonas/git/tct-models/.venv/bin/python scripts/smoke_muon_train.py [cuda|cpu]
+     uv run --project /path/to/tct-models python scripts/smoke_muon_train.py [cuda|cpu]
 """
 import sys
 import torch

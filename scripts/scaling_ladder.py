@@ -60,8 +60,9 @@ def parse_args():
     p.add_argument("--seeds", type=str, default="0",
                    help="comma list of harness --seed values per rung; the gap is averaged "
                         "(paired) across them. Default '0' keeps the single-seed behaviour; "
-                        "pass e.g. '0,1,2' for the load-bearing pass. Seeds vary WEIGHT INIT "
-                        "only (the data loader is deterministic).")
+                        "pass e.g. '0,1,2' for the load-bearing pass. Seeds vary BOTH weight "
+                        "init AND the train data window (different parquet shards -> genuinely "
+                        "different documents); VAL is held fixed across seeds.")
     p.add_argument("--mode", choices=["fixed", "optimal", "both"], default="both")
     p.add_argument("--fixed-iters", type=int, default=2000)
     p.add_argument("--opt-max-iters", type=int, default=2500, help="iters at the largest depth in optimal mode")

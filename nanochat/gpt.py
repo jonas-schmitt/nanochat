@@ -40,7 +40,10 @@ class GPTConfig:
 
 
 def norm(x):
-    return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
+    # Runs in bf16 (COMPUTE_DTYPE): bf16's 8-bit exponent range (same as fp32) prevents
+    # overflow in x.square() for typical activation magnitudes. fp16 inputs would overflow
+    # (5-bit exponent, max ~65504), so this RMSNorm is bf16-ONLY — do not cast to fp16.
+    return F.rms_norm(x, (x.size(-1),))
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.

@@ -16,7 +16,7 @@ Three checks, all hardware-independent (default CPU):
     updates of the correct shape.
 
 Run:  PYTHONPATH=/home/jonas/git/nanochat:/home/jonas/git/gns/src \
-      /home/jonas/git/tct-models/.venv/bin/python scripts/sanity_muon_orth.py
+      uv run --project /path/to/tct-models python scripts/sanity_muon_orth.py
 """
 import sys
 import torch
@@ -67,8 +67,8 @@ def check_a_harness_equivalence():
     # eager unfused path and the compiled fused kernel agree only to bf16 rounding /
     # reduction order. Two independent implementations agreeing to bf16 tol is the proof
     # of algorithmic identity here — a transcription bug (wrong sign/dim) would be O(1).
-    ok = worst < 3e-2
-    print(f"    -> worst rel {worst:.3e}  {'PASS' if ok else 'FAIL'} (gate < 3e-2; bf16 "
+    ok = worst < 1e-2
+    print(f"    -> worst rel {worst:.3e}  {'PASS' if ok else 'FAIL'} (gate < 1e-2; bf16 "
           f"compute + compiled-vs-eager reduction order)")
     return ok
 
@@ -76,7 +76,10 @@ def check_a_harness_equivalence():
 def ref_polar(X, coeffs, dtype):
     """Reference: frob-normalize then odd polynomial steps — the semantics a gns
     Normalize('frob') + PolyStep schedule should reproduce. Single 2-D matrix."""
-    Xb = (X / X.norm()).to(dtype)
+    # Match production polar_express_orth's divisor exactly (frob * 1.01 + 1e-6),
+    # NOT plain X.norm(), so check_b validates deployment semantics rather than
+    # an idealized frob-only normalization.
+    Xb = (X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)).to(dtype)
     m, n = Xb.shape
     for a, b, c in coeffs:
         if m > n:
