@@ -58,6 +58,30 @@ stage shrink1e2 --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms 
 # ===== A2 — under-training check (longer d12) =========================================================
 stage d12_long  --depths 12 --fixed-iters 3000 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 
+# ===== W — WIDTH scaling (direction 1, notes/scaling-directions-not-sampled.md) =======================
+# The campaign's "scale" axis is DEPTH (d6->d12); frontier SOTA is WIDE, not deep. If the ortho_shampoo
+# win GROWS with width at fixed depth, the d12 erosion is a depth-specific artifact irrelevant to the
+# regime where SOTA lives. Wide nets have more high-kappa MLP factors (the ones curvature helps) without
+# depth-induced gradient-flow complications. P(win survives width) plausibly > P(survives depth).
+# aspect 64 = the campaign default (d6 w384, d8 w512); 96/128 push width up at FIXED depth.
+#   d6 a96 -> w640 (~30M, ~= d8);  d6 a128 -> w768 (~42M, between d8 and d12)
+#   d8 a96 -> w768 (~57M);          d8 a128 -> w1024 (~101M, > d12)
+# WIN SIGNAL: the ortho_shampoo gap vs muon becomes MORE negative as aspect grows (within a fixed depth).
+stage width_d6_a96  --depths 6 --aspect-ratio 96  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+stage width_d6_a128 --depths 6 --aspect-ratio 128 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+stage width_d8_a96  --depths 8 --aspect-ratio 96  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+stage width_d8_a128 --depths 8 --aspect-ratio 128 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+
+# ===== F — orthogonalization FREQUENCY (direction 2, notes/scaling-directions-not-sampled.md) =========
+# Every arm applies the preconditioner EVERY step; at d12 the benefit saturates while cumulative
+# disruption grows. Apply the polar/curvature map only every K steps, raw Nesterov in between (both arms
+# at the same K so the gap comparison is fair). Tests whether over-orthogonalization at depth causes the
+# d12 erosion. WIN SIGNAL: the ortho_shampoo gap at d12 becomes significantly <0 as K increases.
+# Also a wall-clock lever (fewer preconditioner applications = cheaper steps) feeding deliverable 4.
+stage orthK2_d12 --depths 12 --orth-every 2 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+stage orthK4_d12 --depths 12 --orth-every 4 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+stage orthK8_d12 --depths 12 --orth-every 8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+
 # tuned-AdamW anchor (resume)
 stage gateA_adamw --depths 8 --fixed-iters 1000 --matrix-lr-grid 0.003,0.01,0.03 --arms muon,adamw
 echo "campaign DONE $(date)" >> "$LOG"

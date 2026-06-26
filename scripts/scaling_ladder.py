@@ -41,13 +41,13 @@ ASPECT, HEAD_DIM = 64, 128  # must match train_compare_precond.build_model
 _TCRIT = {1: 12.71, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262}
 
 
-def width(depth: int) -> int:
-    base = depth * ASPECT
+def width(depth: int, aspect: int = ASPECT) -> int:
+    base = depth * aspect
     return ((base + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
 
 
-def nonembed_params(depth: int) -> int:
-    d = width(depth)
+def nonembed_params(depth: int, aspect: int = ASPECT) -> int:
+    d = width(depth, aspect)
     return 12 * depth * d * d  # ~ attn(4d^2) + mlp(8d^2) per layer
 
 
@@ -82,6 +82,15 @@ def parse_args():
                    help="grammar CoupledStep order sequence passed to the harness inverse-root")
     p.add_argument("--shampoo-ridge", type=str, default="",
                    help="harness shampoo-ridge (effective shrinkage); empty = harness default 1e-4")
+    p.add_argument("--aspect-ratio", type=int, default=64,
+                   help="model width = depth * aspect-ratio (rounded to head_dim). Default 64 = the "
+                        "depth-scaling campaign. Higher aspect at fixed depth = the WIDTH-scaling probe "
+                        "(direction 1, notes/scaling-directions-not-sampled.md): does the curvature win "
+                        "grow with width at fixed depth? Frontier SOTA is wide, not deep.")
+    p.add_argument("--orth-every", type=int, default=1,
+                   help="apply the polar/preconditioner every K steps (passed to the harness). Default 1 "
+                        "= every step. Tests the over-orthogonalization-at-depth hypothesis (direction 2, "
+                        "notes/scaling-directions-not-sampled.md).")
     p.add_argument("--tag", type=str, default="")
     p.add_argument("--restart", action="store_true",
                    help="ignore any existing checkpoint for this --tag and start fresh")
@@ -89,7 +98,8 @@ def parse_args():
 
 
 def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path, seed=0,
-                synth_alpha=1.0, synth_ortho=1, precond_orders="", shampoo_ridge=""):
+                synth_alpha=1.0, synth_ortho=1, precond_orders="", shampoo_ridge="",
+                aspect_ratio=64, orth_every=1):
     # unique per-call --out (race-free) that the harness ALSO checkpoints per (arm,lr) to, so a driver
     # restart resumes a half-done depth instead of recomputing it. The harness resume signature includes
     # seed, so a seed-specific out_path resumes each seed independently.
@@ -97,6 +107,7 @@ def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path, seed=
            "--arms", arms, "--matrix-lr-grid", lr_grid, "--device-batch-size", str(dbs),
            "--max-seq-len", str(seq), "--seed", str(seed), "--synth-alpha", str(synth_alpha),
            "--synth-ortho", str(synth_ortho), "--precond-coupled-orders", precond_orders,
+           "--aspect-ratio", str(aspect_ratio), "--orth-every", str(orth_every),
            "--out", str(out_path)]
     if shampoo_ridge:
         cmd += ["--shampoo-ridge", str(shampoo_ridge)]
@@ -114,7 +125,7 @@ def collect(res, arms_list):
 
 
 def optimal_iters(depth, max_depth, args):
-    r = nonembed_params(depth) / nonembed_params(max_depth)
+    r = nonembed_params(depth, args.aspect_ratio) / nonembed_params(max_depth, args.aspect_ratio)
     return max(args.opt_min_iters, round(args.opt_max_iters * r))
 
 
@@ -174,7 +185,8 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
             print(f"  [resume] {name} d{d} already checkpointed — skipping")
             continue
         it = iters_of(d)
-        print(f"\n===== depth {d} (width {width(d)}, ~{nonembed_params(d)/1e6:.1f}M non-embed) "
+        print(f"\n===== depth {d} (width {width(d, args.aspect_ratio)}, "
+              f"~{nonembed_params(d, args.aspect_ratio)/1e6:.1f}M non-embed) "
               f"x {it} iters x {len(seeds)} seed(s) =====")
         per_seed = []  # collect()-style dict per seed
         for s in seeds:
@@ -182,9 +194,11 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
             res = run_harness(d, ",".join(arms_list), it, args.matrix_lr_grid,
                               args.device_batch_size, args.max_seq_len, args.compile, sub_out, seed=s,
                               synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho,
-                              precond_orders=args.precond_coupled_orders, shampoo_ridge=args.shampoo_ridge)
+                              precond_orders=args.precond_coupled_orders, shampoo_ridge=args.shampoo_ridge,
+                              aspect_ratio=args.aspect_ratio, orth_every=args.orth_every)
             per_seed.append(collect(res, arms_list))
-        rec = {"depth": d, "width": width(d), "nonembed_params": nonembed_params(d),
+        rec = {"depth": d, "width": width(d, args.aspect_ratio),
+               "nonembed_params": nonembed_params(d, args.aspect_ratio),
                "iters": it, "seeds": {s: per_seed[i] for i, s in enumerate(seeds)}, "candidates": {}}
         # arms summary = seed-mean of best_val/wall_s (lr reported as the per-seed list)
         rec["arms"] = {a: {"best_val": float(np.mean([ps[a]["best_val"] for ps in per_seed])),
@@ -225,7 +239,7 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
 
 _CKPT_KEYS = ("depths", "arms", "matrix_lr_grid", "seeds", "fixed_iters", "opt_max_iters",
               "opt_min_iters", "device_batch_size", "max_seq_len", "synth_alpha", "synth_ortho",
-              "precond_coupled_orders", "shampoo_ridge")
+              "precond_coupled_orders", "shampoo_ridge", "aspect_ratio", "orth_every")
 
 
 def load_or_init(path, args, depths, baseline, candidates):
@@ -269,7 +283,8 @@ def batch_sweep(args, candidates, baseline, arms_list):
         res = run_harness(args.batch_sweep_depth, ",".join(arms_list), args.batch_sweep_iters,
                           args.matrix_lr_grid, bs, args.max_seq_len, args.compile, sub_out,
                           synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho,
-                          precond_orders=args.precond_coupled_orders, shampoo_ridge=args.shampoo_ridge)
+                          precond_orders=args.precond_coupled_orders, shampoo_ridge=args.shampoo_ridge,
+                          aspect_ratio=args.aspect_ratio, orth_every=args.orth_every)
         arms = collect(res, arms_list)
         wmuon = arms[baseline]["wall_s"]; bmuon = arms[baseline]["best_val"]
         # record the val-loss GAP, not just overhead: the quality question is whether the
@@ -352,7 +367,9 @@ def main():
     print(f"\n[saved] {out_json}")
     for m in modes:
         for c, t in payload[f"pass_{m}"]["trend"].items():
-            print(f"  {m:8s} {c}: slope {t['gap_vs_logwidth_slope']:+.4f}  ({t['verdict']})")
+            slope = t["gap_vs_logwidth_slope"]
+            slope_str = f"{slope:+.4f}" if slope is not None else "n/a"
+            print(f"  {m:8s} {c}: slope {slope_str}  ({t['verdict']})")
 
 
 if __name__ == "__main__":

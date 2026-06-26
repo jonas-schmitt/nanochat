@@ -74,6 +74,11 @@ def parse_args():
     p.add_argument("--beta2", type=float, default=0.95)          # NorMuon second-moment EMA
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--ns-steps", type=int, default=5)
+    p.add_argument("--orth-every", type=int, default=1,
+                   help="apply the polar/preconditioner direction map only every K steps; on off-steps "
+                        "the raw Nesterov momentum is used (no polar/curvature map). Default 1 = every "
+                        "step (current behavior). Tests the over-orthogonalization-at-depth hypothesis "
+                        "(direction 2, notes/scaling-directions-not-sampled.md).")
     p.add_argument("--warmup-steps", type=int, default=20)
     p.add_argument("--shampoo-beta", type=float, default=0.95)
     p.add_argument("--shampoo-ridge", type=float, default=1e-4)
@@ -262,6 +267,12 @@ def _soap_step(p, st, lr, args, eps=1e-8):
 def direction(arm, p, st, grad, args, step):
     gm = _nesterov(grad, st, args.momentum)
     use_precond = step >= args.warmup_steps and st.get("Linv") is not None
+    # orth-every: on off-steps skip the polar/curvature direction map entirely and use raw Nesterov.
+    # This applies the preconditioner every K steps instead of every step, testing whether
+    # over-orthogonalization at depth causes the d12 erosion (direction 2,
+    # notes/scaling-directions-not-sampled.md). Default orth_every=1 is a no-op (every step).
+    if args.orth_every > 1 and (step % args.orth_every != 0):
+        return gm
     if arm == "sgd":
         return gm
     if arm == "muon":
@@ -404,7 +415,8 @@ def main():
     if out_path.exists():
         try:
             prev = json.loads(out_path.read_text()); pc = prev.get("config", {})
-            sig = ("depth", "seed", "arms", "matrix_lr_grid", "num_iterations", "device_batch_size")
+            sig = ("depth", "seed", "arms", "matrix_lr_grid", "num_iterations", "device_batch_size",
+               "orth_every")
             if [pc.get(k) for k in sig] == [cfg[k] for k in sig]:
                 done = prev.get("_done", {})
                 if done:

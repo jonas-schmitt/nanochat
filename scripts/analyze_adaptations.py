@@ -79,6 +79,27 @@ def main():
         for c, cc in r["candidates"].items():
             line(f"d12_long d{r['depth']} {c}", cc)
 
+    print("\n========== W — WIDTH scaling (does the curvature win grow with WIDTH at fixed depth?) ==========")
+    print("    (compare to camp_curv at aspect 64 = the depth-scaling reference. WIN = gap more negative")
+    print("     as aspect grows within a fixed depth — the d12 erosion would be a depth-specific artifact.)")
+    for tag in ("width_d6_a96", "width_d6_a128", "width_d8_a96", "width_d8_a128"):
+        rs = rungs(tag)
+        if not rs:
+            continue
+        for r in sorted(rs, key=lambda r: r["depth"]):
+            for c, cc in r["candidates"].items():
+                line(f"{tag} d{r['depth']} {c}", cc)
+
+    print("\n========== F — orthogonalization FREQUENCY (does less frequent orth hold at d12?) ==========")
+    print("    (both arms at the same K; WIN = ortho_shampoo gap at d12 becomes significant as K grows.)")
+    for k in ("2", "4", "8"):
+        rs = rungs(f"orthK{k}_d12")
+        if not rs:
+            continue
+        for r in sorted(rs, key=lambda r: r["depth"]):
+            for c, cc in r["candidates"].items():
+                line(f"orthK{k}_d12 d{r['depth']} {c}", cc)
+
     print("\n========== A-alloc — per-factor kappa allocation (layer_adaptive vs muon) ==========")
     print("    (compare to camp_curv ortho_shampoo at the same depth = uniform-curvature reference)")
     for r in sorted(rungs("layer_adapt") or [], key=lambda r: r["depth"]):
