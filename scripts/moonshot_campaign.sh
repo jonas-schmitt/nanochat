@@ -102,7 +102,43 @@ stage1 shrink1e4 --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms
 stage1 shrink1e3 --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 3,3,3,3,3,3 --shampoo-ridge 1e-3
 stage1 shrink1e2 --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,3,3,3 --shampoo-ridge 1e-2
 
-# ===== 5. PROVENANCE (3-seed; quick — re-establish with fixed harness for verification) ===============
+# ===== 5. PRACTICAL-RELEVANCE DIRECTIONS (1-seed scouts; cheaper/faster Muon + new methods) ==========
+# These test whether we can make Muon CHEAPER (same quality, less wall-clock) or find new methods.
+# All use the same harness (fair comparison, wall-clock logged). Priorities per TODO.md ranking.
+
+# ===== C1 — 4-step polar (direction 2: 20% cheaper Muon, same quality; P~65%) ========================
+# Joint-optimized 4-step polar coefficients (results/jointopt_grammar_probe.json). Compare vs 5-step muon.
+stage1 cost_4step_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_4step,muon_3step
+stage1 cost_4step_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_4step,muon_3step
+
+# ===== C2 — fp8 polar end-to-end (direction 1: 1.8× faster Muon via fp8 tensor cores; P~70%) =========
+# Uses gns.fused run_polar_2d with fp8e4m3 precision + polar_express coefficients. Shape guard (C8 fix)
+# falls back to bf16 for non-16-divisible matrices. Compare wall-clock + quality vs bf16 muon.
+stage1 fp8_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_fp8
+stage1 fp8_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_fp8
+
+# ===== C3 — low-rank orthogonalization (direction 4: cheaper Muon for wide models; P~40%) ============
+# Truncated SVD orthogonalization. k=64 default; k=32 stress test. Compare wall-clock + quality.
+# NOTE: full SVD is not yet faster than 5 polar matmuls — this tests QUALITY first, wall-clock second.
+stage1 lowrank_d8    --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,lowrank_orth --lowrank-k 64
+stage1 lowrank_d12   --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,lowrank_orth --lowrank-k 64
+stage1 lowrank_k32_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,lowrank_orth --lowrank-k 32
+stage1 lowrank_k32_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,lowrank_orth --lowrank-k 32
+
+# ===== E — eigenbasis composition (direction 6: polar within Kronecker eigenbasis; P~15%) ===========
+# Genuinely new method — polar in the commuting symmetric subspace where matrix stability holds.
+# Compare vs ortho_shampoo (standard basis) at the same depth.
+stage1 eigen_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,eigenbasis_shampoo
+stage1 eigen_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,eigenbasis_shampoo
+
+# ===== AN — annealed alpha (direction 7: adaptive curvature strength over training; P~10%) ===========
+# Ramp alpha from 0 (Muon) to 0.5/1.0 over warmup steps. Compare vs static alpha.
+stage1 alpha_anneal05_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,synth --synth-alpha 0.5 --synth-alpha-warmup 750
+stage1 alpha_anneal05_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,synth --synth-alpha 0.5 --synth-alpha-warmup 750
+stage1 alpha_anneal10_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,synth --synth-alpha 1.0 --synth-alpha-warmup 750
+stage1 alpha_anneal10_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,synth --synth-alpha 1.0 --synth-alpha-warmup 750
+
+# ===== 6. PROVENANCE (3-seed; quick — re-establish with fixed harness for verification) ===============
 
 # A-alloc (FALSIFIED 2026-06-26): per-factor kappa allocation underperformed even uniform curvature
 # at d12 (gap +0.0091, worse than Muon). Kept for provenance/verification on resume.

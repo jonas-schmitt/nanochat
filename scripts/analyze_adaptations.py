@@ -110,6 +110,43 @@ def main():
             if c == "ortho_shampoo":
                 line(f"[ref] camp_curv d{r['depth']} {c}", cc)
 
+    print("\n========== C — cheaper/faster Muon (directions 1,2: cost-reduction arms) ==========")
+    print("    (WIN = same quality as muon at lower wall-clock. Compare wall_s and val.)")
+    for tag in ("cost_4step_d8", "cost_4step_d12", "cost_3step_d8",
+                "fp8_d8", "fp8_d12",
+                "lowrank_d8", "lowrank_d12",
+                "lowrank_k32_d8", "lowrank_k32_d12"):
+        rs = rungs(tag)
+        if not rs:
+            continue
+        for r in sorted(rs, key=lambda r: r["depth"]):
+            for c, cc in r["candidates"].items():
+                m, sd, t, n, sig = stat(cc)
+                oh = cc.get("overhead", float("nan"))
+                print(f"    {tag} d{r['depth']} {c:16s} gap {m:+.4f} ±{sd:.4f} (n={n}) t={t:+.2f}"
+                      f"  {'** SIGNIF' if sig else 'n.s.'}  wall_overhead={oh:+.1%}")
+
+    print("\n========== E — eigenbasis composition (direction 6: polar within Kronecker eigenbasis) ==========")
+    print("    (compare to camp_curv ortho_shampoo at the same depth = standard-basis reference)")
+    for tag in ("eigen_d8", "eigen_d12"):
+        rs = rungs(tag)
+        if not rs:
+            continue
+        for r in sorted(rs, key=lambda r: r["depth"]):
+            for c, cc in r["candidates"].items():
+                line(f"{tag} d{r['depth']} {c}", cc)
+
+    print("\n========== AN — annealed alpha (direction 7: adaptive curvature strength over training) ==========")
+    print("    (compare to alpha* stages at the same final alpha = static reference)")
+    for tag in ("alpha_anneal05_d8", "alpha_anneal05_d12",
+                "alpha_anneal10_d8", "alpha_anneal10_d12"):
+        rs = rungs(tag)
+        if not rs:
+            continue
+        for r in sorted(rs, key=lambda r: r["depth"]):
+            for c, cc in r["candidates"].items():
+                line(f"{tag} d{r['depth']} {c}", cc)
+
 
 if __name__ == "__main__":
     main()

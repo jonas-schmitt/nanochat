@@ -92,6 +92,11 @@ def parse_args():
                    help="apply the polar/preconditioner every K steps (passed to the harness). Default 1 "
                         "= every step. Tests the over-orthogonalization-at-depth hypothesis (direction 2, "
                         "notes/scaling-directions-not-sampled.md).")
+    p.add_argument("--lowrank-k", type=int, default=64,
+                   help="lowrank_orth arm: rank-k SVD approximation (passed to harness). 0 = disabled.")
+    p.add_argument("--synth-alpha-warmup", type=int, default=0,
+                   help="synth arm: ramp alpha from 0 to --synth-alpha over this many steps (passed to "
+                        "harness). 0 = static alpha (current behavior).")
     p.add_argument("--tag", type=str, default="")
     p.add_argument("--restart", action="store_true",
                    help="ignore any existing checkpoint for this --tag and start fresh")
@@ -100,7 +105,7 @@ def parse_args():
 
 def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path, seed=0,
                 synth_alpha=1.0, synth_ortho=1, precond_orders="", shampoo_ridge="",
-                aspect_ratio=64, orth_every=1):
+                aspect_ratio=64, orth_every=1, lowrank_k=64, synth_alpha_warmup=0):
     # unique per-call --out (race-free) that the harness ALSO checkpoints per (arm,lr) to, so a driver
     # restart resumes a half-done depth instead of recomputing it. The harness resume signature includes
     # seed, so a seed-specific out_path resumes each seed independently.
@@ -109,6 +114,7 @@ def run_harness(depth, arms, iters, lr_grid, dbs, seq, compile_, out_path, seed=
            "--max-seq-len", str(seq), "--seed", str(seed), "--synth-alpha", str(synth_alpha),
            "--synth-ortho", str(synth_ortho), "--precond-coupled-orders", precond_orders,
            "--aspect-ratio", str(aspect_ratio), "--orth-every", str(orth_every),
+           "--lowrank-k", str(lowrank_k), "--synth-alpha-warmup", str(synth_alpha_warmup),
            "--out", str(out_path)]
     if shampoo_ridge:
         cmd += ["--shampoo-ridge", str(shampoo_ridge)]
@@ -196,7 +202,8 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
                               args.device_batch_size, args.max_seq_len, args.compile, sub_out, seed=s,
                               synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho,
                               precond_orders=args.precond_coupled_orders, shampoo_ridge=args.shampoo_ridge,
-                              aspect_ratio=args.aspect_ratio, orth_every=args.orth_every)
+                              aspect_ratio=args.aspect_ratio, orth_every=args.orth_every,
+                              lowrank_k=args.lowrank_k, synth_alpha_warmup=args.synth_alpha_warmup)
             per_seed.append(collect(res, arms_list))
         rec = {"depth": d, "width": width(d, args.aspect_ratio),
                "nonembed_params": nonembed_params(d, args.aspect_ratio),
@@ -240,7 +247,8 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
 
 _CKPT_KEYS = ("depths", "arms", "matrix_lr_grid", "seeds", "fixed_iters", "opt_max_iters",
               "opt_min_iters", "device_batch_size", "max_seq_len", "synth_alpha", "synth_ortho",
-              "precond_coupled_orders", "shampoo_ridge", "aspect_ratio", "orth_every")
+              "precond_coupled_orders", "shampoo_ridge", "aspect_ratio", "orth_every",
+               "lowrank_k", "synth_alpha_warmup")
 
 
 def load_or_init(path, args, depths, baseline, candidates):
@@ -285,7 +293,8 @@ def batch_sweep(args, candidates, baseline, arms_list):
                           args.matrix_lr_grid, bs, args.max_seq_len, args.compile, sub_out,
                           synth_alpha=args.synth_alpha, synth_ortho=args.synth_ortho,
                           precond_orders=args.precond_coupled_orders, shampoo_ridge=args.shampoo_ridge,
-                          aspect_ratio=args.aspect_ratio, orth_every=args.orth_every)
+                          aspect_ratio=args.aspect_ratio, orth_every=args.orth_every,
+                          lowrank_k=args.lowrank_k, synth_alpha_warmup=args.synth_alpha_warmup)
         arms = collect(res, arms_list)
         wmuon = arms[baseline]["wall_s"]; bmuon = arms[baseline]["best_val"]
         # record the val-loss GAP, not just overhead: the quality question is whether the

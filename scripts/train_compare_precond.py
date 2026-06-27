@@ -38,7 +38,7 @@ import torch
 
 from nanochat.common import compute_init, compute_cleanup
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.optim import polar_express_orth
+from nanochat.optim import polar_express_orth, polar_express_coeffs
 from nanochat.tokenizer import get_tokenizer
 from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
 
@@ -50,6 +50,23 @@ from gns.fused import PolarStep, run_polar_2d  # noqa: E402
 from gns.precision import TORCH_DTYPE, Prec  # noqa: E402
 
 GNS_OUT = Path("/home/jonas/git/gns/results/precond_train_compare.json")
+
+# Joint-optimized 4-step polar coefficients (from results/jointopt_grammar_probe.json).
+# Match polar_express 5-step quality (L∞ 4.3e-3 vs polar_express tightness) at 20% lower cost.
+# Direction 2: "4-step polar" — cheaper Muon, same quality.
+JOINTOPT_4STEP_COEFFS = [
+    (3.78665, -5.89811, 2.26281),
+    (3.39514, -5.67786, 2.57043),
+    (2.36862, -3.56152, 1.79741),
+    (2.84245, -4.23397, 2.73999),
+]
+
+# Joint-optimized 3-step polar coefficients (lower quality, 40% cheaper — stress test).
+JOINTOPT_3STEP_COEFFS = [
+    (4.14125, -6.02906, 2.45243),
+    (3.44765, -4.70214, 1.72506),
+    (3.26689, -4.35382, 1.91733),
+]
 
 
 def _atomic_write(path, payload):
@@ -116,6 +133,14 @@ def parse_args():
     p.add_argument("--out", type=str, default="",
                    help="output JSON path (default: the shared GNS_OUT). Per-(arm,lr) results are "
                         "checkpointed here so an interrupted run resumes, skipping completed sub-runs.")
+    # --- practical-relevance extensions (directions 1,2,4,6,7 in TODO.md) ---
+    p.add_argument("--lowrank-k", type=int, default=64,
+                   help="lowrank_orth arm: rank-k SVD approximation for cheaper orthogonalization. "
+                        "Direction 4: cheaper Muon for wide models. k=0 = full-rank (disabled).")
+    p.add_argument("--synth-alpha-warmup", type=int, default=0,
+                   help="synth arm: linearly ramp alpha from 0 to --synth-alpha over this many steps. "
+                        "Direction 7: annealed curvature strength (early=Muon robust, late=Shampoo curvature). "
+                        "0 = static alpha (current behavior).")
     return p.parse_args()
 
 
@@ -257,6 +282,57 @@ def _synth_dir(gm, st, args):
     return polar_express_orth(D, args.ns_steps) if args.synth_ortho else D
 
 
+def _polar_with_coeffs(gm, coeffs):
+    """Polar orthogonalization using arbitrary (a,b,c) coefficient triples via the gns.fused path.
+    Used by muon_4step / muon_3step / muon_fp8 arms — cheaper or faster-precision Muon."""
+    schedule = tuple(PolarStep(coeffs=t, prec=Prec.bf16) for t in coeffs)
+    return run_polar_2d(gm, schedule).to(gm.dtype)
+
+
+def _polar_fp8(gm, coeffs):
+    """fp8 polar orthogonalization via gns.fused run_polar_2d with fp8e4m3 precision.
+    Direction 1: 1.8× faster Muon (fp8 tensor cores), same quality (polar is well-conditioned)."""
+    schedule = tuple(PolarStep(coeffs=t, prec=Prec.fp8e4m3) for t in coeffs)
+    return run_polar_2d(gm, schedule).to(gm.dtype)
+
+
+def _eigenbasis_shampoo_dir(gm, st, args):
+    """Direction 6: polar within the Kronecker eigenbasis (composition order change).
+    Instead of polar_express_orth(L^{-1/4} G R^{-1/4}) in the STANDARD basis, diagonalize
+    L=Q_L D_L Q_L^T, R=Q_R D_R Q_R^T, precondition in the eigenbasis (diagonal scaling),
+    apply polar there, then rotate back. Keeps the iterate in the commuting symmetric subspace
+    (where exp22/G2 showed matrix stability holds)."""
+    if st.get("Q_L") is None or st.get("Q_R") is None:
+        # Not yet refreshed — fall back to standard ortho_shampoo
+        return polar_express_orth(_shampoo_dir(gm, st), args.ns_steps)
+    QL, QR = st["Q_L"], st["Q_R"]
+    # Rotate gradient into eigenbasis (Q are fp32 from eigh)
+    ghat = QL.t() @ gm.float() @ QR
+    # Diagonal preconditioning in eigenbasis (eigenvalues of L^{-1/4}, R^{-1/4})
+    dL = st.get("dL")
+    dR = st.get("dR")
+    if dL is not None and dR is not None:
+        ghat = (dL.unsqueeze(1) * ghat) * dR.unsqueeze(0)
+    # Polar in eigenbasis (polar_express_orth returns bf16; cast for matmul)
+    ghat_orth = polar_express_orth(ghat, args.ns_steps).float()
+    # Rotate back
+    return (QL @ ghat_orth @ QR.t()).to(gm.dtype)
+
+
+def _lowrank_orth(gm, k):
+    """Direction 4: low-rank SVD orthogonalization for cheaper Muon on wide models.
+    Instead of 5 polar_express matmuls on the full (m×n) gradient, compute a rank-k SVD
+    approximation and return U_k @ V_k^h. For k << min(m,n) this is dramatically cheaper
+    (one SVD vs 5 matmuls). Quality: close to full-rank if G has fast spectral decay
+    (gradients often do early in training). Uses truncated SVD for correctness first;
+    a randomized SVD can replace it for wall-clock speedup."""
+    gf = gm.float()
+    U, S, Vh = torch.linalg.svd(gf, full_matrices=False)
+    k = min(k, S.shape[0])
+    # U: (..., m, k), Vh: (..., k, n) → U_k @ V_k^h = U[..., :k] @ Vh[..., :k, :]
+    return (U[..., :k] @ Vh[..., :k, :]).to(gm.dtype)
+
+
 # ----------------------------- SOAP: Adam in the Kronecker eigenbasis -----------------------------
 def _soap_refresh_basis(st):
     """Recompute the factor eigenbases Q_L,Q_R and rotate the in-basis momentum to stay aligned
@@ -301,6 +377,18 @@ def direction(arm, p, st, grad, args, step):
         return gm
     if arm == "muon":
         return polar_express_orth(gm, args.ns_steps)
+    if arm == "muon_4step":  # Direction 2: 4-step joint-opt polar (20% cheaper Muon)
+        return _polar_with_coeffs(gm, JOINTOPT_4STEP_COEFFS)
+    if arm == "muon_3step":  # 3-step joint-opt polar (40% cheaper, stress test)
+        return _polar_with_coeffs(gm, JOINTOPT_3STEP_COEFFS)
+    if arm == "muon_fp8":   # Direction 1: fp8 polar (1.8× faster Muon via fp8 tensor cores)
+        return _polar_fp8(gm, polar_express_coeffs)
+    if arm == "lowrank_orth":  # Direction 4: low-rank SVD orthogonalization (cheaper Muon)
+        return _lowrank_orth(gm, args.lowrank_k) if args.lowrank_k > 0 else polar_express_orth(gm, args.ns_steps)
+    if arm == "eigenbasis_shampoo":  # Direction 6: polar within Kronecker eigenbasis
+        if not use_precond:
+            return polar_express_orth(gm, args.ns_steps)
+        return _eigenbasis_shampoo_dir(gm, st, args)
     if arm == "searched_polar":  # ③: a searched gns.fused polar schedule as the U->O map
         return run_polar_2d(gm, args._polar_schedule).to(gm.dtype)
     if arm == "shampoo":
@@ -316,6 +404,12 @@ def direction(arm, p, st, grad, args, step):
             return polar_express_orth(_shampoo_dir(gm, st), args.ns_steps)
         return polar_express_orth(gm, args.ns_steps)
     if arm == "synth":  # Muon<->Shampoo spectral interpolation (curvature strength alpha)
+        # Direction 7: annealed alpha — ramp from 0 (pure Muon) to args.synth_alpha over warmup steps.
+        if args.synth_alpha_warmup > 0 and step <= args.synth_alpha_warmup:
+            alpha = args.synth_alpha * step / args.synth_alpha_warmup
+            # Recompute Linv_a/Rinv_a at the current annealed alpha (lightweight: just power of existing Linv)
+            st["Linv_a"] = _spd_power(st["Linv"], alpha)
+            st["Rinv_a"] = _spd_power(st["Rinv"], alpha)
         if not use_precond:
             return polar_express_orth(gm, args.ns_steps) if args.synth_ortho else gm
         return _synth_dir(gm, st, args)
@@ -336,7 +430,8 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
               "R": torch.zeros(p.shape[1], p.shape[1], device=device),
               "Linv": None, "Rinv": None, "kappa": 1.0,
               "Q_L": None, "Q_R": None, "msoap": None, "vsoap": None} for p in mp]
-    needs_factors = arm in ("shampoo", "ortho_shampoo", "layer_adaptive", "synth", "soap")
+    needs_factors = arm in ("shampoo", "ortho_shampoo", "layer_adaptive", "synth", "soap",
+                            "eigenbasis_shampoo")
 
     log = {"step": [], "val": [], "wall_ms": []}
     ev_start = torch.cuda.Event(enable_timing=True); ev_start.record()
@@ -368,8 +463,19 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                             if arm == "layer_adaptive":
                                 st["kappa"] = max(_kappa_proxy(st["L"]), _kappa_proxy(st["R"]))
                             if arm == "synth":
-                                st["Linv_a"] = _spd_power(st["Linv"], args.synth_alpha)
-                                st["Rinv_a"] = _spd_power(st["Rinv"], args.synth_alpha)
+                                if args.synth_alpha_warmup > 0 and step <= args.synth_alpha_warmup:
+                                    alpha = args.synth_alpha * step / args.synth_alpha_warmup
+                                else:
+                                    alpha = args.synth_alpha
+                                st["Linv_a"] = _spd_power(st["Linv"], alpha)
+                                st["Rinv_a"] = _spd_power(st["Rinv"], alpha)
+                            if arm == "eigenbasis_shampoo":
+                                # Eigendecompose L,R for in-eigenbasis polar (direction 6)
+                                evals_L, evecs_L = torch.linalg.eigh(0.5 * (st["L"] + st["L"].t()))
+                                evals_R, evecs_R = torch.linalg.eigh(0.5 * (st["R"] + st["R"].t()))
+                                st["Q_L"], st["Q_R"] = evecs_L, evecs_R
+                                st["dL"] = evals_L.clamp_min(1e-12).pow(-0.25)
+                                st["dR"] = evals_R.clamp_min(1e-12).pow(-0.25)
                 if arm == "soap":   # Adam in the eigenbasis; bypasses NorMuon, own Adam-range LR
                     _soap_step(p, st, lr * lrm, args)
                     continue
@@ -445,7 +551,7 @@ def main():
             # Backward-compatible: a key ABSENT from an old checkpoint defaults to the current value
             # (so adding --orth-every does not re-run pre-existing 3-seed work that never had it).
             sig = ("depth", "seed", "arms", "matrix_lr_grid", "num_iterations", "device_batch_size",
-                   "orth_every", "aspect_ratio")
+                   "orth_every", "aspect_ratio", "lowrank_k", "synth_alpha_warmup")
             if [pc.get(k, cfg[k]) for k in sig] == [cfg[k] for k in sig]:
                 done = prev.get("_done", {})
                 if done:
