@@ -481,7 +481,11 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                     continue
                 D = direction(arm, p, st, p.grad, args, step)
                 if not torch.isfinite(D).all():
-                    D = _nesterov(p.grad, st, args.momentum)  # robustness fallback
+                    # robustness fallback: plain Nesterov direction. direction() already
+                    # advanced st["mom"] once (its first line calls _nesterov); re-running
+                    # _nesterov here would lerp the gradient into st["mom"] a SECOND time
+                    # (double EMA update). Reuse the already-advanced buffer instead.
+                    D = p.grad.lerp(st["mom"], args.momentum)
                 # Cosine-annealed weight decay (matching production base_train.py:get_weight_decay)
                 cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / args.num_iterations))
                 apply_norm_caution_update(D, p, st, lr * lrm, cos_wd, args.beta2)
