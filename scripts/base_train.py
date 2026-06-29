@@ -86,6 +86,20 @@ user_config = vars(args).copy()  # for logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+# GNS cross-arm fairness (audit C2): compute_init() sets float32_matmul_precision("high")
+# (TF32, ~10-bit accumulation). A gns-schedule arm runs through gns.executor, which forces
+# TF32 OFF (DESIGN convention 6: genuine fp32 accumulation); a `fused`/`polar_express` arm
+# does not, so the two would silently accumulate fp32 differently across runs — breaking the
+# apples-to-apples comparison and the gns rounding model's u_fp32 assumption. Pin TF32 OFF
+# for ALL arms here so every --muon-schedule run accumulates fp32 identically. (Stock-nanochat
+# production training, which does not vary --muon-schedule, is unaffected by intent: this
+# script is the GNS optimizer-comparison entry point.)
+if device_type == "cuda":
+    torch.set_float32_matmul_precision("highest")  # no TF32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0

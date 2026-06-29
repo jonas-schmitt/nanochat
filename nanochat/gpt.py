@@ -386,14 +386,24 @@ class GPT(nn.Module):
             raise NotImplementedError("muon_orth != 'fused' requires single-GPU MuonAdamW (the GNS experiments run single-GPU)")
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Muon's own guidance (and the MuonAdamW docstring) is to NOT orthogonalize tiny /
+        # {0,1}-D parameters: NorMuon variance reduction is noisy on a handful of samples and
+        # orthogonalizing a sub-32-dim matrix has no theoretical basis. The only such block
+        # parameter is the value-embedding gate ve_gate (n_kv_head x 12); route it (and any
+        # future sub-tile block matrix) to AdamW instead of Muon. This matches the GNS
+        # comparison harness (train_compare_precond.matrix_params, MIN_MUON_DIM). (audit H2)
+        MUON_MIN_DIM = 32
+        all_h_params = list(self.transformer.h.parameters())
+        matrix_ids = {id(p) for p in all_h_params if p.dim() == 2 and min(p.shape) >= MUON_MIN_DIM}
+        matrix_params = [p for p in all_h_params if id(p) in matrix_ids]
+        small_matrix_params = [p for p in all_h_params if id(p) not in matrix_ids]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(small_matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -409,6 +419,11 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # Sub-tile block matrices (ve_gate): AdamW, treated like the value-embedding path it
+        # gates. Appended only when present so no optimizer sees an empty param group. (audit H2)
+        if small_matrix_params:
+            param_groups.append(dict(kind='adamw', params=small_matrix_params,
+                lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

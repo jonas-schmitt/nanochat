@@ -15,7 +15,9 @@ Direction maps:
   layer_adaptive : per-factor: ortho_shampoo if kappa_proxy > thresh else muon   (② allocation)
 
 L,R = EMA Kronecker factors (G Gᵀ, Gᵀ G); L^(-1/4) by the coupled Newton–Schulz production (gns.coupled,
-fp32, power-iteration λmax, relative ridge), recomputed every K steps. Non-matrix params: shared AdamW.
+fp32, power-iteration λmax, relative ridge), recomputed every K steps. Non-matrix params: AdamW with
+the production gpt.py per-group config (per-group LR/betas/eps/wd), identical across arms, so the
+comparison runs in the real-nanochat regime rather than one mistuned shared-LR group (audit C3(c)).
 Identical model init + pre-materialised climbmix batches across arms; per-arm matrix-LR sweep (fair
 tuning). Logs val loss vs BOTH step and wall-clock.
 
@@ -416,11 +418,44 @@ def direction(arm, p, st, grad, args, step):
     raise ValueError(arm)
 
 
+def _build_other_adam(model, mp_ids):
+    """Production-matched AdamW for the non-matrix params (audit C3(c)).
+
+    Previously the harness drove ALL non-matrix params (embeddings, lm_head, value-embeds,
+    scalars, ve_gate) through a single plain AdamW at --adam-lr with weight_decay=0. That is
+    fair across arms (identical for every arm) but runs the model in a very different REGIME
+    from real nanochat training (e.g. embeddings at 3e-3 vs production ~0.2), which weakens
+    the EXTERNAL validity of "arm X beats Muon" (does it transfer to production?). Mirror
+    gpt.py setup_optimizer's per-group config exactly so the comparison happens in the
+    production regime. Matrix params (handled by the arm's direction map) are excluded; each
+    group carries base_lr for the warmup ramp. NOTE: --adam-lr no longer affects these groups."""
+    m = getattr(model, "_orig_mod", model)
+    s = (m.config.n_embd / 768) ** -0.5  # dmodel_lr_scale, matching gpt.py
+    groups = [
+        dict(params=list(m.lm_head.parameters()),          base_lr=0.004 * s,     betas=(0.8, 0.96),  eps=1e-10, weight_decay=0.01),
+        dict(params=list(m.transformer.wte.parameters()),  base_lr=0.2 * s,       betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
+        dict(params=list(m.value_embeds.parameters()),     base_lr=0.2 * s * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+        dict(params=[m.resid_lambdas],                     base_lr=0.5 * 0.01,    betas=(0.8, 0.95),  eps=1e-10, weight_decay=0.05),
+        dict(params=[m.x0_lambdas],                        base_lr=0.5,           betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+        dict(params=[m.smear_gate.weight, m.smear_lambda, m.backout_lambda], base_lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+    ]
+    # ve_gate (sub-tile block matrices, filtered out of the matrix path by MIN_MUON_DIM):
+    # grouped with the value-embedding path it gates, matching the gpt.py H2 fix.
+    named = {id(p) for g in groups for p in g["params"]}
+    small = [p for p in m.transformer.h.parameters() if id(p) not in mp_ids and id(p) not in named]
+    if small:
+        groups.append(dict(params=small, base_lr=0.2 * s * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01))
+    # every non-matrix param must be covered exactly once (mirrors gpt.py setup_optimizer's assert)
+    covered = {id(p) for g in groups for p in g["params"]}
+    other_ids = {id(p) for p in m.parameters() if id(p) not in mp_ids}
+    assert covered == other_ids, "non-matrix param partition mismatch (model structure changed?)"
+    return torch.optim.AdamW([dict(g, lr=g["base_lr"]) for g in groups])
+
+
 def run_arm(arm, lr, args, model, train_batches, val_batches, device):
     mp = matrix_params(model)
     mp_set = {id(p) for p in mp}
-    other = [p for p in model.parameters() if id(p) not in mp_set]
-    adam = torch.optim.AdamW(other, lr=args.adam_lr, betas=(0.9, 0.95), weight_decay=0.0)
+    adam = _build_other_adam(model, mp_set)
     # `adamw` baseline: matrix params on standard AdamW too (the conventional strong baseline, not just
     # the SGD floor). Its LR is the swept matrix-lr, so pass an Adam-range --matrix-lr-grid for it.
     madam = (torch.optim.AdamW(mp, lr=lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
@@ -490,7 +525,7 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                 cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / args.num_iterations))
                 apply_norm_caution_update(D, p, st, lr * lrm, cos_wd, args.beta2)
         for gpar in adam.param_groups:
-            gpar["lr"] = args.adam_lr * lrm
+            gpar["lr"] = gpar["base_lr"] * lrm
         adam.step()
         if madam is not None:
             for g in madam.param_groups:
