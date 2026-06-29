@@ -96,6 +96,8 @@ def parse_args():
     p.add_argument("--beta2", type=float, default=0.9)           # NorMuon second-moment EMA (production Muon)
     p.add_argument("--weight-decay", type=float, default=0.28)   # production Muon cautious WD (cosine-annealed)
     p.add_argument("--ns-steps", type=int, default=5)
+    p.add_argument("--lookahead-k", type=int, default=6, help="muon_lookahead: sync interval (steps)")
+    p.add_argument("--lookahead-alpha", type=float, default=0.5, help="muon_lookahead: slow-weight step")
     p.add_argument("--orth-every", type=int, default=1,
                    help="apply the polar/preconditioner direction map only every K steps; on off-steps "
                         "the raw Nesterov momentum is used (no polar/curvature map). Default 1 = every "
@@ -377,7 +379,7 @@ def direction(arm, p, st, grad, args, step):
         return gm
     if arm == "sgd":
         return gm
-    if arm == "muon":
+    if arm in ("muon", "muon_lookahead"):  # muon_lookahead: same direction, lookahead wrapper in run_arm
         return polar_express_orth(gm, args.ns_steps)
     if arm == "muon_4step":  # Direction 2: 4-step joint-opt polar (20% cheaper Muon)
         return _polar_with_coeffs(gm, JOINTOPT_4STEP_COEFFS)
@@ -469,6 +471,12 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
               "Q_L": None, "Q_R": None, "msoap": None, "vsoap": None} for p in mp]
     needs_factors = arm in ("shampoo", "ortho_shampoo", "layer_adaptive", "synth", "soap",
                             "eigenbasis_shampoo")
+    # P-temporal (2026-06-29): Lookahead (Zhang et al. 2019) wraps any base arm — a ~free convergence
+    # accelerator (no extra matmuls). Every k steps the slow weights move alpha toward the fast weights
+    # and the fast weights reset to slow. Tests whether a TEMPORAL primitive (not curvature) gives a
+    # faster-converging Muon = iso-FLOP win. Active only for the muon_lookahead arm.
+    lookahead = arm == "muon_lookahead"
+    slow = [p.detach().clone() for p in model.parameters()] if lookahead else None
 
     log = {"step": [], "val": [], "wall_ms": []}
     ev_start = torch.cuda.Event(enable_timing=True); ev_start.record()
@@ -533,6 +541,11 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
             for g in madam.param_groups:
                 g["lr"] = lr * lrm
             madam.step()
+        if lookahead and step % args.lookahead_k == 0:  # sync slow<-fast, reset fast<-slow (~free)
+            with torch.no_grad():
+                for p, s in zip(model.parameters(), slow):
+                    s.add_(p.detach() - s, alpha=args.lookahead_alpha)
+                    p.copy_(s)
         if step % args.eval_every == 0 or step == 1:
             torch.cuda.synchronize()
             ev_now = torch.cuda.Event(enable_timing=True); ev_now.record(); torch.cuda.synchronize()
