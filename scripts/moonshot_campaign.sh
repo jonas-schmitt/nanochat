@@ -56,10 +56,13 @@ stage1(){ local tag="$1"; shift
 #   (2) can we ship "cheaper Muon, same quality"?  -> Tier 1 cost arms (the fallback deliverable)
 # ========================================================================================================
 
-# ===== TIER 0. CORE 3-SEED BASELINE — RE-RUN under production regime (~2-3h; was archived) ===========
-stage3 gateA_curv  --depths 8     --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-stage3 camp_curv   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-stage3 camp_gram   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
+# ===== TIER 0. CORE 3-SEED BASELINE (d6/d8) — RE-RUN under production regime (~5h; was archived) ======
+# d12 baseline DEFERRED to Tier 0b (runs AFTER the Tier-1 width/cost triage). Rationale: d12 is ~half the
+# baseline cost (~5.8h, likely more under genuine-fp32) and the decisive width-vs-depth signal lives at
+# d6/d8. d12 is KEPT, just run later — see Tier 0b. (2026-06-29 defer decision.)
+stage3 gateA_curv  --depths 8   --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+stage3 camp_curv   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+stage3 camp_gram   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
 # batch16: PRUNED (redundant). device-batch 16 == the default, so batch16-d8 just re-replicates camp_curv
 # d8 and batch16-d12 re-replicates camp_curv d12 — no new information. camp_curv already re-establishes
 # d6/d8/d12 under the production regime. Revive only if you want a second independent d8 replication.
@@ -70,7 +73,7 @@ stage3 camp_gram   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --ar
 # --- WIDTH at fixed depth: THE width-vs-depth / MoE question (~1.5h) ---------------------------------
 # The campaign's only scale axis was DEPTH (d6->d12, width grew with it) so "erodes at d12" is confounded:
 # depth or total-scale? These vary WIDTH at fixed depth to separate them. Clean contrast:
-#   width_d8_a96 (d8, w768)  vs  camp_curv d12 (d12, w768)  == SAME WIDTH, different depth.
+#   width_d8_a96 (d8, w768)  vs  camp_curv_d12 (d12, w768; Tier 0b)  == SAME WIDTH, different depth.
 # WIN = ortho_shampoo gap grows (more negative) as aspect grows at fixed depth -> erosion is depth-specific
 # -> method is relevant to the WIDE (MoE) regime where SOTA lives, and the grammar/fp8 cost wins compound.
 #   d6 a96->w576, a128->w768 ; d8 a96->w768, a128->w1024
@@ -87,6 +90,17 @@ stage1 cost_4step_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arm
 # validated in training. Shape guard (C8) falls back to bf16 for non-16-divisible matrices.
 stage1 fp8_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_fp8
 stage1 fp8_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_fp8
+
+# ===== TIER 0b. DEFERRED d12 BASELINE (3-seed, ~5.8h) — the expensive coupled inverse-root at depth ===
+# KEPT, not dropped. Runs AFTER the cheap triage so the width-vs-depth signal lands first; Ctrl-C here if
+# the Tier-1 width result already settles whether a fresh d12 baseline is worth it. Re-confirms the d12
+# erosion under the production regime and supplies the SAME-WIDTH depth-isolation contrast for the width
+# question (width_d8_a96 d8/w768  vs  camp_curv_d12 d12/w768). Uses SEPARATE *_d12 tags (not --depths 12
+# appended to camp_curv) so a re-run never hard-aborts load_or_init on the depths checkpoint key.
+# Note: analyze_adaptations reads these under the camp_curv_d12 / camp_gram_d12 tags (not stitched into
+# the camp_curv depth-trend) — compare the d12 gaps to camp_curv d6/d8 by hand.
+stage3 camp_curv_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+stage3 camp_gram_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
 
 # ===== TIER 2. EXPENSIVE — GATED on a Tier-1 signal =================================================
 # Prune-directive (2026-06-29): only the cheap Tier-1 triage runs unattended. Expensive (d12 / large-batch
