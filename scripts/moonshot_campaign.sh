@@ -39,23 +39,30 @@ stage1(){ local tag="$1"; shift
 # Upgrade a scout that shows signal: `scaling_ladder.py --tag <tag> --restart --seeds 0,1,2 ...`.
 
 # ========================================================================================================
-# TIERED REORDER (2026-06-29): value-first. The core-baseline block is DONE (gateA_curv/camp_curv/
-# camp_gram/batch16-d8 all checkpointed → finalise in seconds). Verdict so far: d6/d8 ortho_shampoo win
-# SURVIVED the stronger audit-fixed baseline (5× replicated, significant); d12 erosion replicated; the
-# searched grammar schedule (camp_gram) gave the biggest d8 gap at the LOWEST cost. Open questions, ranked:
+# REGIME RE-RUN + TIERED REORDER (2026-06-29). Two things happened today:
+# (a) PRODUCTION-REGIME FIX: nanochat bf03701/6130fd0 closed C3(c) (non-matrix params now use production
+#     per-group AdamW; embedding LR ~0.2 vs old 3e-3) and pinned TF32 OFF for every arm (coupled
+#     inverse-root now GENUINE fp32, not ~10-bit TF32). These change the numerics for EVERY arm, so the
+#     Jun-28 results/precond_* are STALE. The harness resume signature does NOT include regime/TF32, so a
+#     resume would silently SKIP them and mix regimes — those checkpoints were therefore ARCHIVED to
+#     gns results/stale-pre-regime-fix/. The Tier-0 block below now RE-COMPUTES fresh under production.
+# (b) PRUNE/REORDER: value-first. Only the cheap high-potential Tier-1 triage runs after the baseline;
+#     heavy/low-value stages are GATED or commented (reversible).
+# Old-regime verdict (to be re-established under production): d6/d8 ortho_shampoo win significant,
+# d12 erosion borderline; camp_gram gave the biggest d8 gap at lowest cost. The coupled cost-win search
+# (102/124/90/72/56) is UNAFFECTED — coupled cost was always exact, no search re-run needed.
+# Open questions after the baseline confirms direction:
 #   (1) is the win WIDTH-driven not depth-driven?  -> Tier 1 width stages (MoE-relevant: frontier is wide)
 #   (2) can we ship "cheaper Muon, same quality"?  -> Tier 1 cost arms (the fallback deliverable)
-# Heavy/low-value stages are GATED or commented out below (reversible) per the 2026-06-29 prune decision.
 # ========================================================================================================
 
-# ===== TIER 0. CORE 3-SEED BASELINE (DONE — resumes in seconds) ======================================
+# ===== TIER 0. CORE 3-SEED BASELINE — RE-RUN under production regime (~2-3h; was archived) ===========
 stage3 gateA_curv  --depths 8     --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 stage3 camp_curv   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 stage3 camp_gram   --depths 6,8,12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
-# batch16: PRUNED. Its d8 rung is DONE and saved (results/scaling_ladder_batch16.json; analyze reads it).
-# d12 was redundant (device-batch 16 == default, just re-replicates camp_curv d12). NOT re-invoked here:
-# changing its --depths would hard-abort load_or_init (depths is a checkpoint key). Leaving it commented
-# keeps the d8 data and avoids both the abort and the redundant ~1.7h d12 recompute.
+# batch16: PRUNED (redundant). device-batch 16 == the default, so batch16-d8 just re-replicates camp_curv
+# d8 and batch16-d12 re-replicates camp_curv d12 — no new information. camp_curv already re-establishes
+# d6/d8/d12 under the production regime. Revive only if you want a second independent d8 replication.
 # stage3 batch16   --depths 8,12 --device-batch-size 16 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 
 # ===== TIER 1. DECISIVE + CHEAP (~3h) — run these first ==============================================
