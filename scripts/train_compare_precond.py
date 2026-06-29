@@ -548,7 +548,16 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)  # stream logs live to file (no block-buffering blind spot)
     _, _, _, world, device = compute_init("cuda")
     assert world == 1
-    torch.set_float32_matmul_precision("high")
+    # TF32 OFF for genuine fp32 accumulation (audit C2, matching base_train and the gns
+    # executor / DESIGN convention 6). The fp32 matmuls here — the gns.coupled inverse-root
+    # (shampoo/ortho_shampoo/synth/eigenbasis arms) and _shampoo_dir — must accumulate in
+    # true fp32 for the gns rounding model (u_fp32 = 2^-24) to be predictive; under "high"
+    # they used ~10-bit TF32. Uniform across arms, so the cross-arm gate stays fair.
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     tok = get_tokenizer(); vocab = tok.get_vocab_size()
 
     def materialise(split, n, resume_state_dict=None):
