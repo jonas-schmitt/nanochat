@@ -150,8 +150,8 @@ def mutate(sched, rng):
 
 
 def scalar_stable(triples, hi=1.0):
-    """Cheap divergence guard (no GPU). run_polar_2d pre-normalises its input (fused.py: Y/=Y.norm()*1.01),
-    so the schedule acts on singular values s in (0,1] via s -> s*(a + b s^2 + c s^4). We reject only
+    """Cheap divergence guard (no GPU). run_polar_2d pre-normalises its input (fused.py: Y/=Y.norm()*1.01+1e-12),
+    so the schedule acts on singular values s in (0,1/1.01] via s -> s*(a + b s^2 + c s^4). We reject only
     schedules that BLOW UP on that domain — orthogonalisation *quality* is judged by the two-scale
     fitness (a poor orthogonaliser simply yields poor loss), so the filter must not exclude valid
     Muon-family schedules (e.g. the quintic, which deliberately does not fix s=1). The width-covariant

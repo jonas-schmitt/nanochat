@@ -7,7 +7,7 @@
 # Launch:  bash scripts/run_gns_campaign.sh
 set -u
 cd "$(dirname "$0")/.."
-PY="uv run --project /path/to/tct-models python"
+PY="uv run --project /home/jonas/git/tct-models python"
 export PYTHONPATH=/home/jonas/git/nanochat:/home/jonas/git/gns/src
 export PYTHONUNBUFFERED=1
 OUT=/home/jonas/git/gns/results/campaign

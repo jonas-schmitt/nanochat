@@ -11,6 +11,7 @@
 set -u
 cd /home/jonas/git/nanochat
 export PYTHONPATH=/home/jonas/git/nanochat:/home/jonas/git/gns/src
+mkdir -p /home/jonas/git/gns/results
 LOG=/home/jonas/git/gns/results/campaign.log
 LOCK=/home/jonas/git/gns/results/campaign.lock
 exec 9>"$LOCK"; if ! flock -n 9; then echo "[campaign] already running — exiting"; exit 0; fi
@@ -60,7 +61,9 @@ stage1(){ local tag="$1"; shift
 # d12 baseline DEFERRED to Tier 0b (runs AFTER the Tier-1 width/cost triage). Rationale: d12 is ~half the
 # baseline cost (~5.8h, likely more under genuine-fp32) and the decisive width-vs-depth signal lives at
 # d6/d8. d12 is KEPT, just run later — see Tier 0b. (2026-06-29 defer decision.)
-stage3 gateA_curv  --depths 8   --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+# gateA_curv d8: PRUNED (redundant). camp_curv already runs d8 with identical config
+# (depths=6,8, same iters/lr/arms/alpha). Revive only if you need an independent d8 replication.
+# stage3 gateA_curv  --depths 8   --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 stage3 camp_curv   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 stage3 camp_gram   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
 # batch16: PRUNED (redundant). device-batch 16 == the default, so batch16-d8 just re-replicates camp_curv

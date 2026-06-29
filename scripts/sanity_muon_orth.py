@@ -129,6 +129,7 @@ def check_c_arm_smoke():
     for name, method in reg.items():
         torch.manual_seed(1)
         params = [torch.nn.Parameter(torch.randn(m, n, device=DEV) * 0.02) for _ in range(K)]
+        param_inits = [p.detach().clone() for p in params]
         groups = [dict(kind="muon", params=params, lr=0.02, momentum=0.95,
                        ns_steps=NS, beta2=0.9, weight_decay=0.28, orth=method)]
         opt = MuonAdamW(groups)
@@ -136,9 +137,9 @@ def check_c_arm_smoke():
             p.grad = torch.randn_like(p)
         opt.step()
         finite = all(torch.isfinite(p).all().item() for p in params)
-        moved = max((p.detach() - 0.02).abs().max().item() for p in params) > 0  # changed
-        tag = "ok" if finite else "NONFINITE"
-        if not finite:
+        moved = any(not torch.allclose(p, p_init) for p, p_init in zip(params, param_inits))
+        tag = "ok" if (finite and moved) else ("NONFINITE" if not finite else "UNMOVED")
+        if not finite or not moved:
             ok = False
         print(f"    {name:24s} {tag}")
     print(f"    -> {'PASS' if ok else 'FAIL'}")

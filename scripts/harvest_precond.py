@@ -95,7 +95,7 @@ def main():
     args = parse_args()
     _, ddp_rank, _, world, device = compute_init("cuda")
     assert world == 1, "harvest is single-GPU"
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("highest")  # TF32 OFF — matches GNS convention 6
 
     tokenizer = get_tokenizer()
     vocab_size = tokenizer.get_vocab_size()

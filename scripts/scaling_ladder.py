@@ -26,6 +26,7 @@ Run (tct-models env + repos on PYTHONPATH):
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -219,8 +220,16 @@ def run_pass(payload, name, depths, iters_of, args, arms_list, baseline, candida
                              for ps in per_seed])
             n = len(gaps); gmean = float(gaps.mean())
             gstd = float(gaps.std(ddof=1)) if n > 1 else 0.0
-            sem = gstd / np.sqrt(n) if n > 1 and gstd > 0 else float("inf")
-            tstat = gmean / sem if np.isfinite(sem) and sem > 0 else 0.0
+            if n > 1 and gstd > 0:
+                sem = gstd / np.sqrt(n)
+                tstat = gmean / sem
+            elif n > 1 and gstd == 0 and gmean != 0:
+                # zero variance with nonzero mean: the most significant possible result
+                sem = 0.0
+                tstat = math.copysign(float("inf"), gmean)
+            else:
+                sem = float("inf")
+                tstat = 0.0
             # one-sided t-test that the paired mean gap is < 0 (candidate beats baseline). This is the
             # rigorous "2 sigma" significance (uncertainty of the MEAN, small-sample t-critical), not an
             # effect-size |mean|>2*SD which would reject real p~0.01 effects.

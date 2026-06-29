@@ -458,7 +458,9 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
     adam = _build_other_adam(model, mp_set)
     # `adamw` baseline: matrix params on standard AdamW too (the conventional strong baseline, not just
     # the SGD floor). Its LR is the swept matrix-lr, so pass an Adam-range --matrix-lr-grid for it.
-    madam = (torch.optim.AdamW(mp, lr=lr, betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    # AdamW uses a lower weight decay than Muon (0.01 vs 0.28) — using Muon's WD mistunes the baseline.
+    adam_wd = 0.01 if arm == "adamw" else args.weight_decay
+    madam = (torch.optim.AdamW(mp, lr=lr, betas=(0.9, 0.95), weight_decay=adam_wd)
              if arm == "adamw" else None)
     state = [{"mom": torch.zeros_like(p), "v2": None,
               "L": torch.zeros(p.shape[0], p.shape[0], device=device),
@@ -534,8 +536,10 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
         if step % args.eval_every == 0 or step == 1:
             torch.cuda.synchronize()
             ev_now = torch.cuda.Event(enable_timing=True); ev_now.record(); torch.cuda.synchronize()
+            model.eval()
             with torch.no_grad():
                 vl = float(np.mean([float(model(vx, vy).item()) for vx, vy in val_batches]))
+            model.train()
             log["step"].append(step); log["val"].append(vl)
             log["wall_ms"].append(ev_start.elapsed_time(ev_now))
             print(f"  [{arm:14s} lr{lr:.3f}] step {step:4d}/{args.num_iterations}  "
@@ -599,7 +603,11 @@ def main():
             # Backward-compatible: a key ABSENT from an old checkpoint defaults to the current value
             # (so adding --orth-every does not re-run pre-existing 3-seed work that never had it).
             sig = ("depth", "seed", "arms", "matrix_lr_grid", "num_iterations", "device_batch_size",
-                   "orth_every", "aspect_ratio", "lowrank_k", "synth_alpha_warmup")
+                   "orth_every", "aspect_ratio", "lowrank_k", "synth_alpha_warmup",
+                   "synth_alpha", "synth_ortho", "precond_coupled_orders",
+                   "shampoo_ridge", "shampoo_recompute_every", "shampoo_coupled_steps",
+                   "ns_steps", "weight_decay", "momentum", "beta2",
+                   "warmup_steps", "n_val_batches", "eval_every")
             if [pc.get(k, cfg[k]) for k in sig] == [cfg[k] for k in sig]:
                 done = prev.get("_done", {})
                 if done:
