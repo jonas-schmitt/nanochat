@@ -107,6 +107,44 @@ def line(label, cc):
     print(f"    {label:22s} gap {m:+.4f} ±{sd:.4f} (n={n}) t={t:+.2f}  {'** SIGNIF' if sig else 'n.s.'}")
 
 
+def _curve(tag, depth, seed, arm):
+    f = RES / f"precond_{tag}_fixed_d{depth}_s{seed}.json"
+    if not f.exists():
+        return None
+    for v in json.loads(f.read_text()).get("_done", {}).values():
+        if v.get("arm") == arm and v.get("curve"):
+            return np.array(v["curve"]["step"]), np.array(v["curve"]["val"])
+    return None
+
+
+def iso_flop_section():
+    """Does the curvature win survive EQUAL COMPUTE? Give muon its FLOP-equivalent extra steps: read
+    ortho at step = n_iters/flop_ratio and compare to muon's final. <0 = ortho wins at iso-FLOP.
+    KEY 2026-06-29 RESULT: strongly NEGATIVE at d8 — the iso-STEP win is a compute artifact."""
+    print("\n========== ISO-FLOP — does the curvature win survive EQUAL COMPUTE? ==========")
+    print("    (read ortho at n_iters/flop_ratio steps vs muon final. <0 = ortho wins at iso-FLOP.)")
+    for tag in ("gateA_curv", "camp_curv", "camp_gram", "isoflop_long_d8"):
+        rs, cf = rungs(tag), cfg(tag)
+        if not rs:
+            continue
+        for r in sorted(rs, key=lambda r: r["depth"]):
+            d = r["depth"]
+            ratio, _ = flop_overhead("ortho_shampoo", r, cf)
+            if ratio is None:
+                continue
+            n = cf.get("fixed_iters", 1500)
+            gs, gf = [], []
+            for s in range(9):
+                mc, oc = _curve(tag, d, s, "muon"), _curve(tag, d, s, "ortho_shampoo")
+                if mc is None or oc is None:
+                    continue
+                gs.append(oc[1][-1] - mc[1][-1])
+                gf.append(float(np.interp(n / ratio, oc[0], oc[1])) - mc[1][-1])
+            if gs:
+                print(f"    {tag} d{d}: iso-step {np.mean(gs):+.4f}  iso-FLOP {np.mean(gf):+.4f}"
+                      f"  ({ratio:.2f}x cost, n={len(gs)})  {'<-- ortho WINS iso-FLOP' if np.mean(gf) < 0 else ''}")
+
+
 def main():
     tags = sorted(p.stem.replace("scaling_ladder_", "") for p in RES.glob("scaling_ladder_*.json"))
     print("available result tags:", tags)
@@ -205,6 +243,8 @@ def main():
                 fp8 = "  [fp8≈same-FLOPs,~2x throughput]" if "fp8" in c else ""
                 print(f"    {tag} d{r['depth']} {c:16s} gap {m:+.4f} ±{sd:.4f} (n={n}) t={t:+.2f}"
                       f"  {'** SIGNIF' if sig else 'n.s.'}  wall={oh:+.1%}{fstr}{fp8}")
+
+    iso_flop_section()
 
     print("\n========== E — eigenbasis composition (direction 6: polar within Kronecker eigenbasis) ==========")
     print("    (compare to camp_curv ortho_shampoo at the same depth = standard-basis reference)")

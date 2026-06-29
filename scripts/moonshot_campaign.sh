@@ -91,6 +91,22 @@ stage1 cost_4step_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arm
 stage1 fp8_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_fp8
 stage1 fp8_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_fp8
 
+# ===== TIER 1b. ISO-FLOP DE-RISK — the decisive accuracy-moonshot gate (2026-06-29) ==================
+# Existing-curve iso-FLOP (analyze_adaptations.py "ISO-FLOP" section) is strongly NEGATIVE at d8: at
+# equal compute Muon wins by +0.18..+0.30 (recompute-10) and +0.05..+0.07 (optimistic recompute-50).
+# The −0.025 win is an iso-STEP artifact. ONLY escape: long horizon (flat curve near convergence shrinks
+# the step-deficit penalty). These stages test that escape; if they fail, the accuracy angle is dead and
+# the deliverable is the cheaper-Muon floor (cost_4step / fp8 above).
+# (1) Long-horizon iso-FLOP: run muon + searched-schedule ortho long at d8; analyze reports iso-FLOP gap
+#     vs horizon. WIN = the iso-FLOP gap CLOSES toward <0 as steps grow.
+stage1 isoflop_long_d8 --depths 8 --fixed-iters 6000 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
+# (2) Recompute×quality: does the win survive the CHEAP amortisation (recompute 50/100) that the iso-FLOP
+#     math needs? NEEDS WIRING FIRST: scaling_ladder.py does NOT yet forward --shampoo-recompute-every to
+#     the harness (train_compare_precond.py accepts it). Add the passthrough, then run both arms at the
+#     same interval so the gap is fair. Lower priority than (1) — even the optimistic recompute-50 iso-FLOP
+#     projection still LOSES (+0.05..0.07), so this only matters in combination with a long-horizon win.
+# stage1 recompute50_d8 --depths 8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3 --shampoo-recompute-every 50
+
 # ===== TIER 0b. DEFERRED d12 BASELINE (3-seed, ~5.8h) — the expensive coupled inverse-root at depth ===
 # KEPT, not dropped. Runs AFTER the cheap triage so the width-vs-depth signal lands first; Ctrl-C here if
 # the Tier-1 width result already settles whether a fresh d12 baseline is worth it. Re-confirms the d12
