@@ -68,26 +68,25 @@ stage3 camp_gram   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms 
 # d6/d8/d12 under the production regime. Revive only if you want a second independent d8 replication.
 # stage3 batch16   --depths 8,12 --device-batch-size 16 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 
-# ===== TIER 1. DECISIVE + CHEAP (~3h) — run these first ==============================================
+# ===== TIER 1. LARGE-BATCH SOTA TEST — the one live shot (2026-06-29 pivot) ==========================
+# WHY: the d8 accuracy win does NOT survive iso-FLOP at batch-16 (Muon wins +0.18..0.30; see the iso-FLOP
+# verdict in gns TODO.md). BUT the overhead is the optimizer's per-step matmuls (batch-INDEPENDENT) while
+# fwd/bwd scales with batch -> total-step FLOP overhead amortizes: b16 2.05x -> b64 1.28x -> b256 1.07x.
+# At large batch iso-FLOP ~ iso-step, AND low gradient noise favors second-order. So large batch is the one
+# practically-relevant regime where curvature could beat Muon at EQUAL compute.
+# WIN = ortho's iso-step edge HOLDS/GROWS at large batch AND the analyze ISO-FLOP readout goes <0.
+# LR ~sqrt(batch/16); batch64 carries an LR grid (LR is the main confound). ortho = default schedule
+# (matches the camp_curv d8 baseline -0.0249 exactly). batch64 is the GATE; 128/256 unlock on a held edge.
+stage1 batch64_d8  --depths 8 --device-batch-size 64  --fixed-iters 1500 --matrix-lr-grid 0.03,0.04,0.06 --arms muon,ortho_shampoo
+# UNLOCK 128/256 only if batch64 shows the iso-step edge HOLDS (then read the ISO-FLOP section there):
+# stage1 batch128_d8 --depths 8 --device-batch-size 128 --fixed-iters 1500 --matrix-lr-grid 0.057,0.08 --arms muon,ortho_shampoo
+# stage1 batch256_d8 --depths 8 --device-batch-size 256 --fixed-iters 1500 --matrix-lr-grid 0.08,0.11  --arms muon,ortho_shampoo
 
-# --- WIDTH at fixed depth: THE width-vs-depth / MoE question (~1.5h) ---------------------------------
-# The campaign's only scale axis was DEPTH (d6->d12, width grew with it) so "erodes at d12" is confounded:
-# depth or total-scale? These vary WIDTH at fixed depth to separate them. Clean contrast:
-#   width_d8_a96 (d8, w768)  vs  camp_curv_d12 (d12, w768; Tier 0b)  == SAME WIDTH, different depth.
-# WIN = ortho_shampoo gap grows (more negative) as aspect grows at fixed depth -> erosion is depth-specific
-# -> method is relevant to the WIDE (MoE) regime where SOTA lives, and the grammar/fp8 cost wins compound.
-#   d6 a96->w576, a128->w768 ; d8 a96->w768, a128->w1024
-stage1 width_d6_a96  --depths 6 --aspect-ratio 96  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-stage1 width_d6_a128 --depths 6 --aspect-ratio 128 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-stage1 width_d8_a96  --depths 8 --aspect-ratio 96  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-stage1 width_d8_a128 --depths 8 --aspect-ratio 128 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-
-# --- CHEAPER MUON: the practical deliverable if accuracy dies (~1.6h) --------------------------------
-# C1 4-step polar (dir 2, P~65%): joint-opt coeffs (results/jointopt_grammar_probe.json) vs 5-step muon.
+# ===== TIER 1b. CHEAPER-MUON FLOOR (cheap; the confirmed deliverable, runs alongside) ===============
+# C1 4-step polar (dir 2): joint-opt coeffs (results/jointopt_grammar_probe.json) vs 5-step muon.
 stage1 cost_4step_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_4step,muon_3step
 stage1 cost_4step_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_4step,muon_3step
-# C2 fp8 polar end-to-end (dir 1, P~70%): exp27 showed 1.76-2.58x kernel speedup at width>=8192, never
-# validated in training. Shape guard (C8) falls back to bf16 for non-16-divisible matrices.
+# C2 fp8 polar end-to-end (dir 1): exp27 showed 1.76-2.58x kernel speedup at width>=8192.
 stage1 fp8_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_fp8
 stage1 fp8_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_fp8
 
@@ -99,7 +98,8 @@ stage1 fp8_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,
 # the deliverable is the cheaper-Muon floor (cost_4step / fp8 above).
 # (1) Long-horizon iso-FLOP: run muon + searched-schedule ortho long at d8; analyze reports iso-FLOP gap
 #     vs horizon. WIN = the iso-FLOP gap CLOSES toward <0 as steps grow.
-stage1 isoflop_long_d8 --depths 8 --fixed-iters 6000 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
+# DEPRIORITIZED 2026-06-29: large batch (Tier 1) is the better escape; revive this as the secondary one.
+# stage1 isoflop_long_d8 --depths 8 --fixed-iters 6000 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
 # (2) Recompute×quality: does the win survive the CHEAP amortisation (recompute 50/100) that the iso-FLOP
 #     math needs? NEEDS WIRING FIRST: scaling_ladder.py does NOT yet forward --shampoo-recompute-every to
 #     the harness (train_compare_precond.py accepts it). Add the passthrough, then run both arms at the
@@ -115,17 +115,20 @@ stage1 isoflop_long_d8 --depths 8 --fixed-iters 6000 --matrix-lr-grid 0.02 --arm
 # appended to camp_curv) so a re-run never hard-aborts load_or_init on the depths checkpoint key.
 # Note: analyze_adaptations reads these under the camp_curv_d12 / camp_gram_d12 tags (not stitched into
 # the camp_curv depth-trend) — compare the d12 gaps to camp_curv d6/d8 by hand.
-stage3 camp_curv_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-stage3 camp_gram_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
+# DEPRIORITIZED 2026-06-29: the d12 erosion matters less now the accuracy angle is iso-FLOP-dead at small
+# batch. Revive if you still want the production-regime d12 baseline / same-width depth-isolation contrast.
+# stage3 camp_curv_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+# stage3 camp_gram_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
 
 # ===== TIER 2. EXPENSIVE — GATED on a Tier-1 signal =================================================
 # Prune-directive (2026-06-29): only the cheap Tier-1 triage runs unattended. Expensive (d12 / large-batch
 # / 3-seed) compute is spent ONLY on a bet Tier 1 actually confirms — never on low-potential mechanism
 # tests run blind. Uncomment a block only when its gate below fires.
 
-# --- GATE: BATCH axis (the other "curvature wins at scale" bet). batch64_d8 is the cheap probe (~1.9h).
-#     If the ortho gap GROWS vs batch16-d8 (-0.0138), unlock the full sweep; else leave it pruned.
-stage1 batch64_d8 --depths 8 --device-batch-size 64 --fixed-iters 1500 --matrix-lr-grid 0.04 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+# --- BATCH axis: now PROMOTED to Tier 1 above (the large-batch SOTA test). The old single-LR gate here is
+#     SUPERSEDED — leaving it active would duplicate the batch64_d8 tag with a different config and abort
+#     load_or_init. Commented out. (Old d8,12 multi-batch variants kept below for reference only.)
+# stage1 batch64_d8 --depths 8 --device-batch-size 64 --fixed-iters 1500 --matrix-lr-grid 0.04 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 # UNLOCK on a positive batch64_d8 signal (high-potential, expensive — the regime where curvature should win):
 # stage1 batch64   --depths 8,12 --device-batch-size 64  --fixed-iters 1500 --matrix-lr-grid 0.04  --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 # stage1 batch128  --depths 8,12 --device-batch-size 128 --fixed-iters 1500 --matrix-lr-grid 0.057 --arms muon,ortho_shampoo,synth --synth-alpha 0.5

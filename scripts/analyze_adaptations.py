@@ -123,7 +123,8 @@ def iso_flop_section():
     KEY 2026-06-29 RESULT: strongly NEGATIVE at d8 — the iso-STEP win is a compute artifact."""
     print("\n========== ISO-FLOP — does the curvature win survive EQUAL COMPUTE? ==========")
     print("    (read ortho at n_iters/flop_ratio steps vs muon final. <0 = ortho wins at iso-FLOP.)")
-    for tag in ("gateA_curv", "camp_curv", "camp_gram", "isoflop_long_d8"):
+    for tag in ("gateA_curv", "camp_curv", "camp_gram",
+                "batch64_d8", "batch128_d8", "batch256_d8", "isoflop_long_d8"):
         rs, cf = rungs(tag), cfg(tag)
         if not rs:
             continue
