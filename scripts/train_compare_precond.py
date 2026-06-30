@@ -51,6 +51,7 @@ from gns.coupled import CoupledInit, CoupledStep  # noqa: E402
 from gns.fused import PolarStep, run_polar_2d  # noqa: E402
 from gns.precision import TORCH_DTYPE, Prec  # noqa: E402
 from gns.incremental_polar import incremental_orth  # noqa: E402  (TODO Idea 1: muon_track arm)
+from gns.subspace_curvature import SubspaceNewton  # noqa: E402  (TODO Idea 2: subspace_newton arm)
 
 GNS_OUT = Path("/home/jonas/git/gns/results/precond_train_compare.json")
 
@@ -99,6 +100,12 @@ def parse_args():
     p.add_argument("--ns-steps", type=int, default=5)
     p.add_argument("--lookahead-k", type=int, default=6, help="muon_lookahead: sync interval (steps)")
     p.add_argument("--lookahead-alpha", type=float, default=0.5, help="muon_lookahead: slow-weight step")
+    # subspace_newton (Idea 2): global tiny-subspace second-order over the concatenated matrix-param momenta.
+    p.add_argument("--subspace-k", type=int, default=32, help="subspace_newton: subspace dim k")
+    p.add_argument("--subspace-refresh", type=int, default=16, help="subspace_newton: SVD refresh interval")
+    p.add_argument("--subspace-buffer", type=int, default=64, help="subspace_newton: gradient buffer size")
+    p.add_argument("--subspace-lr", type=float, default=0.5, help="subspace_newton: strength of the (trust-region-bounded) Newton correction")
+    p.add_argument("--subspace-ridge", type=float, default=1e-4, help="subspace_newton: curvature SPD floor / condition cap")
     p.add_argument("--orth-every", type=int, default=1,
                    help="apply the polar/preconditioner direction map only every K steps; on off-steps "
                         "the raw Nesterov momentum is used (no polar/curvature map). Default 1 = every "
@@ -460,6 +467,35 @@ def _build_other_adam(model, mp_ids):
     return torch.optim.AdamW([dict(g, lr=g["base_lr"]) for g in groups])
 
 
+def _subspace_newton_step(mp, state, tracker, args, lr, lrm, step):
+    """Idea 2: global tiny-subspace second-order over the matrix params.
+
+    Concatenates the per-param Nesterov momenta into one vector, takes a Newton step in the LEARNED
+    global top-k subspace (``tracker.correction`` — HVP-free secant curvature, trust-region bounded)
+    and applies Muon (polar) in the complement, per param. During warmup (no subspace/curvature yet)
+    ``correction`` returns ``(None, g)`` so this is exactly Muon. The subspace correction is applied as
+    a separate, ``--subspace-lr``-scaled nudge in the ~k high-curvature directions where it pays."""
+    cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / args.num_iterations))
+    idx = [j for j in range(len(mp)) if mp[j].grad is not None]
+    if not idx:
+        return
+    gms = [_nesterov(mp[j].grad, state[j], args.momentum) for j in idx]
+    flat_g = torch.cat([g.reshape(-1) for g in gms])
+    flat_x = torch.cat([mp[j].detach().reshape(-1) for j in idx])
+    corr, comp = tracker.correction(flat_x, flat_g)
+    off = 0
+    for j in idx:
+        p = mp[j]; nj = p.numel()
+        comp_j = comp[off:off + nj].reshape(p.shape)
+        D = polar_express_orth(comp_j, args.ns_steps)        # Muon in the complement
+        if not torch.isfinite(D).all():
+            D = comp_j
+        apply_norm_caution_update(D, p, state[j], lr * lrm, cos_wd, args.beta2)
+        if corr is not None:                                 # Newton step in the top-k subspace
+            p.sub_((args.subspace_lr * lrm * corr[off:off + nj].reshape(p.shape)).to(p.dtype))
+        off += nj
+
+
 def run_arm(arm, lr, args, model, train_batches, val_batches, device):
     mp = matrix_params(model)
     mp_set = {id(p) for p in mp}
@@ -483,6 +519,10 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
     # faster-converging Muon = iso-FLOP win. Active only for the muon_lookahead arm.
     lookahead = arm == "muon_lookahead"
     slow = [p.detach().clone() for p in model.parameters()] if lookahead else None
+    subspace = arm == "subspace_newton"
+    sub_tracker = (SubspaceNewton(k=args.subspace_k, lr_base=0.0, buffer_size=args.subspace_buffer,
+                                  refresh_every=args.subspace_refresh, ridge=args.subspace_ridge)
+                   if subspace else None)
 
     log = {"step": [], "val": [], "wall_ms": []}
     ev_start = torch.cuda.Event(enable_timing=True); ev_start.record()
@@ -493,7 +533,9 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
         loss.backward()
         lrm = min(1.0, step / max(1, args.warmup_steps))
         with torch.no_grad():
-            for j, p in enumerate(mp):
+            if subspace:             # Idea 2: one global subspace step across all matrix params
+                _subspace_newton_step(mp, state, sub_tracker, args, lr, lrm, step)
+            for j, p in (enumerate(mp) if not subspace else []):
                 if p.grad is None:
                     continue
                 if arm == "adamw":   # matrix params handled by the AdamW optimizer (madam) below
