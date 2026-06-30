@@ -383,9 +383,10 @@ def direction(arm, p, st, grad, args, step):
     if arm in ("muon", "muon_lookahead"):  # muon_lookahead: same direction, lookahead wrapper in run_arm
         return polar_express_orth(gm, args.ns_steps)
     if arm == "muon_track":  # Idea 1: incremental orthogonalization (dynamic polar tracking).
-        # Warm-starts the polar across steps from per-param state st["ipolar_S"]; ~1 NS step when
-        # the momentum varies slowly, exact eigendecomposition fallback otherwise. Drop-in for muon.
-        return incremental_orth(gm, st)
+        # Warm-starts the polar across steps from per-param state st["ipolar_S"]; ~1 NS step per step
+        # with a cold eigendecomposition refresh every 8 steps. Scheduled (sync-free) mode -> no
+        # per-step host sync, torch.compile-friendly, so the matmul savings become real wall-clock.
+        return incremental_orth(gm, st, refresh_every=8)
     if arm == "muon_4step":  # Direction 2: 4-step joint-opt polar (20% cheaper Muon)
         return _polar_with_coeffs(gm, JOINTOPT_4STEP_COEFFS)
     if arm == "muon_3step":  # 3-step joint-opt polar (40% cheaper, stress test)
