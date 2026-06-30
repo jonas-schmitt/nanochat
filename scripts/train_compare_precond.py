@@ -50,6 +50,7 @@ from gns import coupled  # noqa: E402
 from gns.coupled import CoupledInit, CoupledStep  # noqa: E402
 from gns.fused import PolarStep, run_polar_2d  # noqa: E402
 from gns.precision import TORCH_DTYPE, Prec  # noqa: E402
+from gns.incremental_polar import incremental_orth  # noqa: E402  (TODO Idea 1: muon_track arm)
 
 GNS_OUT = Path("/home/jonas/git/gns/results/precond_train_compare.json")
 
@@ -381,6 +382,10 @@ def direction(arm, p, st, grad, args, step):
         return gm
     if arm in ("muon", "muon_lookahead"):  # muon_lookahead: same direction, lookahead wrapper in run_arm
         return polar_express_orth(gm, args.ns_steps)
+    if arm == "muon_track":  # Idea 1: incremental orthogonalization (dynamic polar tracking).
+        # Warm-starts the polar across steps from per-param state st["ipolar_S"]; ~1 NS step when
+        # the momentum varies slowly, exact eigendecomposition fallback otherwise. Drop-in for muon.
+        return incremental_orth(gm, st)
     if arm == "muon_4step":  # Direction 2: 4-step joint-opt polar (20% cheaper Muon)
         return _polar_with_coeffs(gm, JOINTOPT_4STEP_COEFFS)
     if arm == "muon_3step":  # 3-step joint-opt polar (40% cheaper, stress test)
