@@ -52,6 +52,8 @@ from gns.fused import PolarStep, run_polar_2d  # noqa: E402
 from gns.precision import TORCH_DTYPE, Prec  # noqa: E402
 from gns.incremental_polar import incremental_orth  # noqa: E402  (TODO Idea 1: muon_track arm)
 from gns.subspace_curvature import SubspaceNewton  # noqa: E402  (TODO Idea 2: subspace_newton arm)
+from gns.module_lr import classify_role, parse_multipliers  # noqa: E402  (TODO Idea 4: muon_roles arm)
+from gns.spectral_snr import spectral_snr_orth  # noqa: E402  (TODO Idea 3 / Bet B E1: soft_muon_snr)
 
 GNS_OUT = Path("/home/jonas/git/gns/results/precond_train_compare.json")
 
@@ -106,6 +108,23 @@ def parse_args():
     p.add_argument("--subspace-buffer", type=int, default=64, help="subspace_newton: gradient buffer size")
     p.add_argument("--subspace-lr", type=float, default=0.5, help="subspace_newton: strength of the (trust-region-bounded) Newton correction")
     p.add_argument("--subspace-ridge", type=float, default=1e-4, help="subspace_newton: curvature SPD floor / condition cap")
+    p.add_argument("--soft-tau", type=float, default=0.1,
+                   help="soft_muon (Idea 3): noise-edge fraction c in tau=c*sigma_max for the Wiener "
+                        "singular-value gate f(s)=s^q/(s^q+c^q). c=0 -> f==1 -> exactly Muon (UVt).")
+    p.add_argument("--soft-q", type=float, default=2.0,
+                   help="soft_muon: Wiener gate sharpness q (q=2 = SNR-optimal Wiener filter).")
+    p.add_argument("--soft-mode", type=str, default="frac", choices=("frac", "mp"),
+                   help="soft_muon: tau scheme. 'frac' = swept fraction of sigma_max (default); "
+                        "'mp' = parameter-free Marchenko-Pastur bulk edge (reserved, not yet wired).")
+    p.add_argument("--snr-strength", type=float, default=1.0,
+                   help="soft_muon_snr (Idea 3 / Bet B E1): strength of the empirical per-direction SNR "
+                        "gate f=σ²/(σ²+strength·n²), n=|uᵢᵀ(g−EMA)vᵢ|. 0 -> exact-SVD polar (==Muon).")
+    p.add_argument("--soft-no-renorm", action="store_true",
+                   help="soft_muon* (Bet B E3): bypass NorMuon's cross-direction renorm so the spectral "
+                        "gate's effect is measured un-masked. Off by default (no change to any arm).")
+    p.add_argument("--role-lr-mults", type=str, default="1,1,1,1",
+                   help="muon_roles (Idea 4 / Bet A): per-role matrix-LR multipliers, CSV in ROLES order "
+                        "attn_qkv,attn_o,mlp_in,mlp_out. '1,1,1,1' == single-LR Muon (the ablation anchor).")
     p.add_argument("--orth-every", type=int, default=1,
                    help="apply the polar/preconditioner direction map only every K steps; on off-steps "
                         "the raw Nesterov momentum is used (no polar/curvature map). Default 1 = every "
@@ -247,9 +266,15 @@ def inv_fourth_root(L, ridge, k, prec=Prec.fp32, orders=None):
 
 
 # ----------------------------- shared post-direction machinery (Muon's) -----------------------------
-def apply_norm_caution_update(D, p, st, lr, wd, beta2):
+def apply_norm_caution_update(D, p, st, lr, wd, beta2, no_renorm=False):
     """NorMuon variance reduction + cautious WD/update, lifted from muon_step_unfused (per-param).
-    `D` is the arm's already-Nesterov-smoothed direction; this is identical across all arms."""
+    `D` is the arm's already-Nesterov-smoothed direction; this is identical across all arms.
+    `no_renorm` (Bet B E3): skip NorMuon's cross-direction renorm and apply the cautious WD update on
+    `D` directly — so a spectral gate's effect is measured un-masked. Default False == unchanged."""
+    if no_renorm:
+        mask = (D * p) >= 0
+        p.sub_((lr * D + lr * wd * p * mask).to(p.dtype))
+        return
     red_dim = -1 if p.shape[-2] >= p.shape[-1] else -2
     g = D
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
@@ -345,6 +370,36 @@ def _lowrank_orth(gm, k):
     return (U[..., :k] @ Vh[..., :k, :]).to(gm.dtype)
 
 
+def _soft_polar(gm, c, q):
+    """Idea 3: spectral-denoising 'soft Muon'. Muon's polar throws Σ away (every singular direction → 1),
+    so it whitens — and maximally AMPLIFIES — the noise-dominated small-σ tail. Instead shrink low-SNR
+    directions with a Wiener gate f(s)=s^q/(s^q+c^q), s=σ/σ_max (scale-invariant). c=0 ⇒ f≡1 ⇒ U Vᵀ
+    (exactly Muon — the clean ablation boundary). SVD prototype (Phase A): NOT iso-cost (SVD vs matmuls);
+    the iso-cost deliverable is a matmul-only thresholded polar polynomial (Phase B, remez_odd_gate).
+    Reuses the _lowrank_orth SVD pattern; output magnitude matches polar_express_orth (UVᵀ at c=0)."""
+    gf = gm.float()
+    U, S, Vh = torch.linalg.svd(gf, full_matrices=False)
+    if c <= 0.0:
+        return (U @ Vh).to(gm.dtype)                       # f≡1 → exactly Muon's polar factor
+    s = S / S[..., :1].clamp_min(1e-12)                    # normalize to σ_max → scale-invariant
+    sq = s.pow(q)
+    f = sq / (sq + (c ** q) + 1e-12)                       # Wiener gate; →1 high-SNR, →0 noise tail
+    return ((U * f.unsqueeze(-2)) @ Vh).to(gm.dtype)       # U diag(f) Vᵀ
+
+
+def _soft_polar_mp(gm, q):
+    """Bet B E2 (parameter-free soft Muon): instead of a swept τ=c·σ_max, estimate the noise floor
+    from the spectrum itself — the MEDIAN normalized singular value, a robust bulk-edge proxy when the
+    small-σ tail is noise — and gate f(s)=s^q/(s^q+c^q), c=median(s). Removes the swept hyperparameter
+    (the full Marchenko–Pastur edge from aspect+effective-noise is deferred). c is floored for safety."""
+    gf = gm.float()
+    U, S, Vh = torch.linalg.svd(gf, full_matrices=False)
+    s = S / S[..., :1].clamp_min(1e-12)
+    c = s.median().clamp_min(1e-6)
+    f = s.pow(q) / (s.pow(q) + c.pow(q) + 1e-12)
+    return ((U * f.unsqueeze(-2)) @ Vh).to(gm.dtype)
+
+
 # ----------------------------- SOAP: Adam in the Kronecker eigenbasis -----------------------------
 def _soap_refresh_basis(st):
     """Recompute the factor eigenbases Q_L,Q_R and rotate the in-basis momentum to stay aligned
@@ -402,6 +457,12 @@ def direction(arm, p, st, grad, args, step):
         return _polar_fp8(gm, polar_express_coeffs)
     if arm == "lowrank_orth":  # Direction 4: low-rank SVD orthogonalization (cheaper Muon)
         return _lowrank_orth(gm, args.lowrank_k) if args.lowrank_k > 0 else polar_express_orth(gm, args.ns_steps)
+    if arm == "soft_muon":  # Idea 3: spectral-denoising soft Muon (Wiener gate on singular values)
+        return _soft_polar(gm, args.soft_tau, args.soft_q)
+    if arm == "soft_muon_snr":  # Idea 3 / Bet B E1: empirical per-direction SNR gate (noise = g - EMA)
+        return spectral_snr_orth(gm, grad.float() - st["mom"].float(), args.snr_strength)
+    if arm == "soft_muon_mp":   # Bet B E2: parameter-free soft Muon (τ from the spectrum's noise bulk)
+        return _soft_polar_mp(gm, args.soft_q)
     if arm == "eigenbasis_shampoo":  # Direction 6: polar within Kronecker eigenbasis
         if not use_precond:
             return polar_express_orth(gm, args.ns_steps)
@@ -499,6 +560,17 @@ def _subspace_newton_step(mp, state, tracker, args, lr, lrm, step):
 def run_arm(arm, lr, args, model, train_batches, val_batches, device):
     mp = matrix_params(model)
     mp_set = {id(p) for p in mp}
+    # Idea 4 / Bet A: per-role matrix-LR multipliers (muon_roles), aligned to `mp`. All-1.0 for every
+    # other arm -> a no-op in apply_norm_caution_update, so muon_roles 1,1,1,1 is byte-identical to muon.
+    _m_orig = getattr(model, "_orig_mod", model)
+    _name_by_id = {id(p): n for n, p in _m_orig.transformer.h.named_parameters()}
+    if arm == "muon_roles":
+        _rmd = parse_multipliers(args.role_lr_mults)
+        roles_vec = [_rmd[classify_role(_name_by_id[id(p)])] for p in mp]
+    else:
+        roles_vec = [1.0] * len(mp)
+    # Bet B E3: NorMuon-bypass ablation, only for the soft-gate arms and only when explicitly enabled.
+    _soft_no_renorm = args.soft_no_renorm and arm in ("soft_muon", "soft_muon_snr", "soft_muon_mp")
     adam = _build_other_adam(model, mp_set)
     # `adamw` baseline: matrix params on standard AdamW too (the conventional strong baseline, not just
     # the SGD floor). Its LR is the swept matrix-lr, so pass an Adam-range --matrix-lr-grid for it.
@@ -581,7 +653,8 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                     D = p.grad.lerp(st["mom"], args.momentum)
                 # Cosine-annealed weight decay (matching production base_train.py:get_weight_decay)
                 cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / args.num_iterations))
-                apply_norm_caution_update(D, p, st, lr * lrm, cos_wd, args.beta2)
+                apply_norm_caution_update(D, p, st, lr * lrm * roles_vec[j], cos_wd, args.beta2,
+                                          no_renorm=_soft_no_renorm)
         for gpar in adam.param_groups:
             gpar["lr"] = gpar["base_lr"] * lrm
         adam.step()
@@ -668,7 +741,8 @@ def main():
                    "synth_alpha", "synth_ortho", "precond_coupled_orders",
                    "shampoo_ridge", "shampoo_recompute_every", "shampoo_coupled_steps",
                    "ns_steps", "weight_decay", "momentum", "beta2",
-                   "warmup_steps", "n_val_batches", "eval_every")
+                   "warmup_steps", "n_val_batches", "eval_every",
+                   "soft_tau", "soft_q", "soft_mode", "snr_strength", "soft_no_renorm", "role_lr_mults")
             if [pc.get(k, cfg[k]) for k in sig] == [cfg[k] for k in sig]:
                 done = prev.get("_done", {})
                 if done:
