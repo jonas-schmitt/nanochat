@@ -468,13 +468,14 @@ def _build_other_adam(model, mp_ids):
 
 
 def _subspace_newton_step(mp, state, tracker, args, lr, lrm, step):
-    """Idea 2: global tiny-subspace second-order over the matrix params.
+    """Idea 2: global tiny-subspace second-order over the matrix params (ADDITIVE design).
 
-    Concatenates the per-param Nesterov momenta into one vector, takes a Newton step in the LEARNED
-    global top-k subspace (``tracker.correction`` — HVP-free secant curvature, trust-region bounded)
-    and applies Muon (polar) in the complement, per param. During warmup (no subspace/curvature yet)
-    ``correction`` returns ``(None, g)`` so this is exactly Muon. The subspace correction is applied as
-    a separate, ``--subspace-lr``-scaled nudge in the ~k high-curvature directions where it pays."""
+    Concatenates the per-param Nesterov momenta, applies **plain Muon to the FULL momentum** (the
+    standard base step), and ADDS a ``--subspace-lr``-scaled Newton correction in the LEARNED global
+    top-k subspace (``tracker.correction`` — HVP-free secant curvature, trust-region bounded). So
+    ``--subspace-lr 0`` is EXACTLY Muon (a verifiable sanity check), and lr>0 is a fair test of whether
+    the curvature helps. (The earlier "Muon in the complement" design projected the dominant directions
+    OUT of the Muon step, so it was worse than Muon even with the correction off — fixed here.)"""
     cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / args.num_iterations))
     idx = [j for j in range(len(mp)) if mp[j].grad is not None]
     if not idx:
@@ -482,16 +483,15 @@ def _subspace_newton_step(mp, state, tracker, args, lr, lrm, step):
     gms = [_nesterov(mp[j].grad, state[j], args.momentum) for j in idx]
     flat_g = torch.cat([g.reshape(-1) for g in gms])
     flat_x = torch.cat([mp[j].detach().reshape(-1) for j in idx])
-    corr, comp = tracker.correction(flat_x, flat_g)
+    corr, _comp = tracker.correction(flat_x, flat_g)         # _comp unused: Muon runs on the full momentum
     off = 0
-    for j in idx:
+    for i, j in enumerate(idx):
         p = mp[j]; nj = p.numel()
-        comp_j = comp[off:off + nj].reshape(p.shape)
-        D = polar_express_orth(comp_j, args.ns_steps)        # Muon in the complement
+        D = polar_express_orth(gms[i], args.ns_steps)        # plain Muon on the FULL momentum
         if not torch.isfinite(D).all():
-            D = comp_j
+            D = gms[i]
         apply_norm_caution_update(D, p, state[j], lr * lrm, cos_wd, args.beta2)
-        if corr is not None:                                 # Newton step in the top-k subspace
+        if corr is not None:                                 # additive Newton nudge in the top-k subspace
             p.sub_((args.subspace_lr * lrm * corr[off:off + nj].reshape(p.shape)).to(p.dtype))
         off += nj
 
