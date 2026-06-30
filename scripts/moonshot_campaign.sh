@@ -31,6 +31,19 @@ stage1(){ local tag="$1"; shift
   echo "### stage $tag start (1-seed SCOUT) $(date) ###" >> "$LOG"
   $LADDER --seeds 0 --tag "$tag" "$@" >> "$LOG" 2>&1
   echo "### stage $tag done $(date) ###" >> "$LOG"; }
+# program_pipeline = the LIVE direction (2026-06-30): Stage-1 NSGA-II program search at d6, then the
+# Stage-2 d6->d8 trend gate on the Pareto knees + Muon + Lookahead. NOT a scaling_ladder call — the
+# composed grammar runs through gns via scripts/search_program.py + scripts/eval_program_trend.py.
+PYBIN="uv run --project /home/jonas/git/tct-models python -u"
+program_pipeline(){
+  echo "### program_search start $(date) ###" >> "$LOG"
+  $PYBIN scripts/search_program.py --depth 6 --steps 1200 --pop 16 --gens 6 --lr 0.02 --seed 0 \
+    --out /home/jonas/git/gns/results/search_program.json >> "$LOG" 2>&1
+  echo "### program_trend_gate start $(date) ###" >> "$LOG"
+  $PYBIN scripts/eval_program_trend.py --depths 6,8 --seeds 0,1,2 --steps 1500 --lr 0.02 \
+    --search-json /home/jonas/git/gns/results/search_program.json --n-knees 3 \
+    --out /home/jonas/git/gns/results/program_trend_gate.json >> "$LOG" 2>&1
+  echo "### program_pipeline done $(date) ###" >> "$LOG"; }
 
 # STAGE ORDER (2026-06-26 post-audit reorder): most promising directions first.
 # All checkpoints were moved to audit-pre-backup/ — campaign starts FRESH with the audit-fixed harness
@@ -57,19 +70,23 @@ stage1(){ local tag="$1"; shift
 #   (2) can we ship "cheaper Muon, same quality"?  -> Tier 1 cost arms (the fallback deliverable)
 # ========================================================================================================
 
-# ===== TIER 0. CORE 3-SEED BASELINE (d6/d8) — RE-RUN under production regime (~5h; was archived) ======
-# d12 baseline DEFERRED to Tier 0b (runs AFTER the Tier-1 width/cost triage). Rationale: d12 is ~half the
-# baseline cost (~5.8h, likely more under genuine-fp32) and the decisive width-vs-depth signal lives at
-# d6/d8. d12 is KEPT, just run later — see Tier 0b. (2026-06-29 defer decision.)
-# gateA_curv d8: PRUNED (redundant). camp_curv already runs d8 with identical config
-# (depths=6,8, same iters/lr/arms/alpha). Revive only if you need an independent d8 replication.
+# ===== TIER 0 (LIVE 2026-06-30). MATRIX-PRIMITIVE PROGRAM SEARCH + TREND GATE ========================
+# The curvature accuracy moonshot is iso-FLOP-falsified (see ARCHIVED block below + TODO ISO-FLOP VERDICT).
+# The live direction is the composed temporal × phase-coupled-polar program search, scored the RIGHT way:
+# NSGA-II on (val, polar-cost) at d6, then a d6->d8 multi-seed TREND gate that judges the margin over
+# vanilla LOOKAHEAD (the free, known floor — NOT Muon). A point-d6 win that shrinks at d8 is rejected here.
+program_pipeline
+
+# ===== ARCHIVED — iso-FLOP-FALSIFIED CURVATURE BASELINE (kept for provenance; do NOT run) =============
+# These re-established the ortho_shampoo curvature edge under the production regime: real but tiny
+# (-0.025 iso-step at d8), DOES NOT survive iso-FLOP (Muon wins +0.18..0.30 at batch-16), and SHRINKS at
+# large batch (batch64 -> -0.006, iso-FLOP +0.086). The "beat Muon on accuracy via curvature" bet is dead
+# across iso-FLOP / batch / width. Results live in gns results/scaling_ladder_camp_{curv,gram}.json (and the
+# pre-regime-fix copies in results/stale-pre-regime-fix/). Revive only to re-replicate the falsification.
+# stage3 camp_curv   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+# stage3 camp_gram   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
 # stage3 gateA_curv  --depths 8   --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-stage3 camp_curv   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
-stage3 camp_gram   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo --precond-coupled-orders 2,2,2,3,3,3,3,3,3
-# batch16: PRUNED (redundant). device-batch 16 == the default, so batch16-d8 just re-replicates camp_curv
-# d8 and batch16-d12 re-replicates camp_curv d12 — no new information. camp_curv already re-establishes
-# d6/d8/d12 under the production regime. Revive only if you want a second independent d8 replication.
-# stage3 batch16   --depths 8,12 --device-batch-size 16 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
+# stage3 batch16     --depths 8,12 --device-batch-size 16 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,ortho_shampoo,synth --synth-alpha 0.5
 
 # ===== TIER 1. LARGE-BATCH SOTA TEST — the one live shot (2026-06-29 pivot) ==========================
 # WHY: the d8 accuracy win does NOT survive iso-FLOP at batch-16 (Muon wins +0.18..0.30; see the iso-FLOP
@@ -78,14 +95,18 @@ stage3 camp_gram   --depths 6,8 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms 
 # At large batch iso-FLOP ~ iso-step, AND low gradient noise favors second-order. So large batch is the one
 # practically-relevant regime where curvature could beat Muon at EQUAL compute.
 # WIN = ortho's iso-step edge HOLDS/GROWS at large batch AND the analyze ISO-FLOP readout goes <0.
-# LR ~sqrt(batch/16); batch64 carries an LR grid (LR is the main confound). ortho = default schedule
-# (matches the camp_curv d8 baseline -0.0249 exactly). batch64 is the GATE; 128/256 unlock on a held edge.
-stage1 batch64_d8  --depths 8 --device-batch-size 64  --fixed-iters 1500 --matrix-lr-grid 0.03,0.04,0.06 --arms muon,ortho_shampoo
+# RESULT (2026-06-29): batch64_d8 went NEGATIVE — the edge SHRANK 4x (-0.0249 b16 -> -0.0060 b64) and
+# iso-FLOP still LOSES (+0.086). This was the last live curvature shot; it failed. ARCHIVED (do NOT run).
+# stage1 batch64_d8  --depths 8 --device-batch-size 64  --fixed-iters 1500 --matrix-lr-grid 0.03,0.04,0.06 --arms muon,ortho_shampoo
 # UNLOCK 128/256 only if batch64 shows the iso-step edge HOLDS (then read the ISO-FLOP section there):
 # stage1 batch128_d8 --depths 8 --device-batch-size 128 --fixed-iters 1500 --matrix-lr-grid 0.057,0.08 --arms muon,ortho_shampoo
 # stage1 batch256_d8 --depths 8 --device-batch-size 256 --fixed-iters 1500 --matrix-lr-grid 0.08,0.11  --arms muon,ortho_shampoo
 
 # ===== TIER 1b. CHEAPER-MUON FLOOR (cheap; the confirmed deliverable, runs alongside) ===============
+# CONFOUND TO FIX BEFORE CLAIMING THE FLOOR (TODO-flagged): the muon arm normalizes with Frobenius x1.01
+# while the muon_4step/muon_3step/muon_fp8 cost arms do not — a ~1% scale mismatch that biases the cost-vs-
+# quality comparison. Unify the normalization across muon and the cost arms in train_compare_precond.py,
+# then re-run these stages, before reporting "cheaper Muon at same quality".
 # C1 4-step polar (dir 2): joint-opt coeffs (results/jointopt_grammar_probe.json) vs 5-step muon.
 stage1 cost_4step_d8  --depths 8  --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_4step,muon_3step
 stage1 cost_4step_d12 --depths 12 --fixed-iters 1500 --matrix-lr-grid 0.02 --arms muon,muon_4step,muon_3step
