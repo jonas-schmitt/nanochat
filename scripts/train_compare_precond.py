@@ -54,6 +54,7 @@ from gns.incremental_polar import incremental_orth  # noqa: E402  (TODO Idea 1: 
 from gns.subspace_curvature import SubspaceNewton  # noqa: E402  (TODO Idea 2: subspace_newton arm)
 from gns.module_lr import classify_role, parse_multipliers  # noqa: E402  (TODO Idea 4: muon_roles arm)
 from gns.spectral_snr import spectral_snr_orth  # noqa: E402  (TODO Idea 3 / Bet B E1: soft_muon_snr)
+from gns.anderson import AndersonAccelerator  # noqa: E402  (TODO NLA N3: muon_anderson_win arm)
 
 GNS_OUT = Path("/home/jonas/git/gns/results/precond_train_compare.json")
 
@@ -102,6 +103,12 @@ def parse_args():
     p.add_argument("--ns-steps", type=int, default=5)
     p.add_argument("--lookahead-k", type=int, default=6, help="muon_lookahead: sync interval (steps)")
     p.add_argument("--lookahead-alpha", type=float, default=0.5, help="muon_lookahead: slow-weight step")
+    # muon_anderson_win (TODO NLA N3): GLOBAL windowed Anderson acceleration of the Muon iterate sequence
+    # (the formulation validated on CPU, distinct from muon_anderson's per-param momentum secant). Window 1
+    # is the iterate-space Anderson(1) control; window 3-5 is the CPU winner (AA(5)>AA(1)>Muon).
+    p.add_argument("--anderson-window", type=int, default=5, help="muon_anderson_win: Anderson window m (0=off=muon)")
+    p.add_argument("--anderson-reg", type=float, default=1e-8, help="muon_anderson_win: Tikhonov ridge on the LS solve")
+    p.add_argument("--anderson-restart", type=int, default=0, help="muon_anderson_win: restart interval (0=never)")
     # subspace_newton (Idea 2): global tiny-subspace second-order over the concatenated matrix-param momenta.
     p.add_argument("--subspace-k", type=int, default=32, help="subspace_newton: subspace dim k")
     p.add_argument("--subspace-refresh", type=int, default=16, help="subspace_newton: SVD refresh interval")
@@ -442,13 +449,40 @@ def direction(arm, p, st, grad, args, step):
         return gm
     if arm == "sgd":
         return gm
-    if arm in ("muon", "muon_lookahead"):  # muon_lookahead: same direction, lookahead wrapper in run_arm
+    if arm in ("muon", "muon_lookahead", "muon_anderson_win"):
+        # muon_lookahead: same direction, lookahead wrapper in run_arm.
+        # muon_anderson_win (N3): same plain-Muon direction; the GLOBAL Anderson correction over the
+        # concatenated matrix-param iterate is applied in run_arm (after the plain step is taken).
         return polar_express_orth(gm, args.ns_steps)
     if arm == "muon_track":  # Idea 1: incremental orthogonalization (dynamic polar tracking).
         # Warm-starts the polar across steps from per-param state st["ipolar_S"]; ~1 NS step per step
         # with a cold eigendecomposition refresh every 8 steps. Scheduled (sync-free) mode -> no
         # per-step host sync, torch.compile-friendly, so the matmul savings become real wall-clock.
         return incremental_orth(gm, st, refresh_every=8)
+    if arm == "muon_roles":  # Idea 4 / Bet A: plain Muon direction; the per-role LR multiplier is applied in run_arm
+        return polar_express_orth(gm, args.ns_steps)
+    if arm == "muon_stiefel":  # Fresh #2: EMA of orthogonalized directions, re-orthogonalized (average on Stiefel).
+        # Muon = polar(EMA(g)); this = reorth(EMA(polar(g))). The scale-free polar(g) EMA isn't dominated by
+        # outlier-magnitude steps → tests whether averaging DIRECTIONS beats averaging raw gradients.
+        O = polar_express_orth(grad, args.ns_steps).float()
+        if st.get("ostief") is None or st["ostief"].shape != O.shape:
+            st["ostief"] = torch.zeros_like(O)
+        st["ostief"].lerp_(O, 1 - args.momentum)
+        return polar_express_orth(st["ostief"], args.ns_steps)
+    if arm == "muon_anderson":  # Fresh #4: Anderson(1)/secant acceleration of the momentum before the polar.
+        # Adaptive multi-point extrapolation vs the grammar's FIXED linear e: D = gm + α·(gm − gm_prev), α from
+        # the secant <f,df>/|df|² (clamped for stability). Warm-up = plain Muon until two increments exist.
+        gmf = gm.float()
+        D = gmf
+        if st.get("gm_prev") is not None:
+            f = gmf - st["gm_prev"]                                  # momentum increment (residual proxy)
+            if st.get("f_prev") is not None:
+                df = f - st["f_prev"]
+                alpha = ((f * df).sum() / (df * df).sum().clamp_min(1e-12)).clamp(-1.0, 1.0)
+                D = gmf + alpha * f
+            st["f_prev"] = f
+        st["gm_prev"] = gmf.clone()
+        return polar_express_orth(D.to(gm.dtype), args.ns_steps)
     if arm == "muon_4step":  # Direction 2: 4-step joint-opt polar (20% cheaper Muon)
         return _polar_with_coeffs(gm, JOINTOPT_4STEP_COEFFS)
     if arm == "muon_3step":  # 3-step joint-opt polar (40% cheaper, stress test)
@@ -591,6 +625,12 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
     # faster-converging Muon = iso-FLOP win. Active only for the muon_lookahead arm.
     lookahead = arm == "muon_lookahead"
     slow = [p.detach().clone() for p in model.parameters()] if lookahead else None
+    # muon_anderson_win (N3): GLOBAL Anderson accelerator over the concatenated matrix-param iterate.
+    # Treats the whole per-step Muon update (incl. NorMuon + cosine WD) as the fixed-point residual f;
+    # x_prev + Anderson(x_prev, f) replaces the plain next iterate. window=0 => exactly plain Muon.
+    anderson = (AndersonAccelerator(m=args.anderson_window, reg=args.anderson_reg,
+                                    restart_every=args.anderson_restart)
+                if arm == "muon_anderson_win" else None)
     subspace = arm == "subspace_newton"
     sub_tracker = (SubspaceNewton(k=args.subspace_k, lr_base=0.0, buffer_size=args.subspace_buffer,
                                   refresh_every=args.subspace_refresh, ridge=args.subspace_ridge)
@@ -605,6 +645,8 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
         loss.backward()
         lrm = min(1.0, step / max(1, args.warmup_steps))
         with torch.no_grad():
+            if anderson is not None:  # N3: snapshot the iterate before the plain Muon step
+                x_prev = torch.cat([p.detach().reshape(-1) for p in mp]).float()
             if subspace:             # Idea 2: one global subspace step across all matrix params
                 _subspace_newton_step(mp, state, sub_tracker, args, lr, lrm, step)
             for j, p in (enumerate(mp) if not subspace else []):
@@ -655,6 +697,14 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                 cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / args.num_iterations))
                 apply_norm_caution_update(D, p, st, lr * lrm * roles_vec[j], cos_wd, args.beta2,
                                           no_renorm=_soft_no_renorm)
+            if anderson is not None:  # N3: global Anderson correction over the concatenated matrix iterate
+                x_new = torch.cat([p.detach().reshape(-1) for p in mp]).float()
+                x_acc = anderson.step(x_prev, x_new - x_prev)   # f = the plain Muon step just taken
+                off = 0
+                for p in mp:
+                    n = p.numel()
+                    p.copy_(x_acc[off:off + n].reshape(p.shape).to(p.dtype))
+                    off += n
         for gpar in adam.param_groups:
             gpar["lr"] = gpar["base_lr"] * lrm
         adam.step()
@@ -742,7 +792,8 @@ def main():
                    "shampoo_ridge", "shampoo_recompute_every", "shampoo_coupled_steps",
                    "ns_steps", "weight_decay", "momentum", "beta2",
                    "warmup_steps", "n_val_batches", "eval_every",
-                   "soft_tau", "soft_q", "soft_mode", "snr_strength", "soft_no_renorm", "role_lr_mults")
+                   "soft_tau", "soft_q", "soft_mode", "snr_strength", "soft_no_renorm", "role_lr_mults",
+                   "anderson_window", "anderson_reg", "anderson_restart")
             if [pc.get(k, cfg[k]) for k in sig] == [cfg[k] for k in sig]:
                 done = prev.get("_done", {})
                 if done:
