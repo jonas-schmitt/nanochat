@@ -110,14 +110,105 @@ def grid(results, seed, tau):
     print()
 
 
+def controls(results, seed):
+    """E3 (soft_muon --soft-no-renorm tau-sweep) + E1 (soft_muon_snr strength-sweep) deciders."""
+    def show(title, base_path, points, path_fn, label):
+        base = _final_val(base_path)
+        print(f"\n{title}")
+        print(f"  {label:>9} {'final_val':>10} {'Δ=val(0)−val(·)':>16}  (Δ>0 ⇒ gate helps)")
+        best = (None, 0.0)
+        for pt in points:
+            v = _final_val(path_fn(pt))
+            if v is None:
+                print(f"  {pt:>9} {'—':>10} {'—':>16}"); continue
+            d = (base - v) if base is not None else float("nan")
+            if d == d and pt != points[0] and d > best[1]:
+                best = (pt, d)
+            print(f"  {pt:>9} {v:>10.4f} {d:>16.4f}")
+        return best
+
+    e3 = show("E3 control — soft_muon, --soft-no-renorm (d6/a64/b16/400)",
+              f"{results}/soft_muon_norenorm_t0.0_s{seed}.json", ["0.0", "0.1", "0.2"],
+              lambda t: f"{results}/soft_muon_norenorm_t{t}_s{seed}.json", "τ")
+    e1 = show("E1 — soft_muon_snr, --soft-no-renorm (estimated per-direction SNR)",
+              f"{results}/soft_muon_snr_norenorm_str0.0_s{seed}.json", ["0.0", "0.5", "1.0", "2.0"],
+              lambda s: f"{results}/soft_muon_snr_norenorm_str{s}_s{seed}.json", "strength")
+    print("\n  VERDICT:")
+    print(f"   E3: {'renorm was NOT masking — σ-magnitude shrinkage robustly hurts' if (e3[0] is None or e3[1] <= 0) else f'no-renorm REVIVES it (best τ={e3[0]}, +{e3[1]:.4f}) → A2 was renorm-masking'}")
+    if e1[0] is None or e1[1] <= 0:
+        print("   E1: estimated-SNR gating does NOT beat strength=0 → spectral-denoising bet DEAD (spectrum is signal). STOP.")
+    else:
+        print(f"   E1: strength={e1[0]} beats 0 by {e1[1]:.4f} → ALIVE; carry to the batch×width grid (where batch-adaptivity is tested).")
+    print()
+
+
+def roles(results, seed):
+    """Idea 4 muon_roles d6 screen: each candidate vs muon anchor AND muon_lookahead floor."""
+    muon = _final_val(f"{results}/roles_muon_s{seed}.json")
+    look = _final_val(f"{results}/roles_lookahead_s{seed}.json")
+    cands = ["io_split", "out_damp", "mlp_up", "attn_up", "mlp_dom"]
+    print(f"\nIdea 4 — muon_roles d6 screen (d6/a64/b16/400, seed {seed})")
+    print(f"  anchor muon={_fmt(muon)}   floor muon_lookahead={_fmt(look)}")
+    print(f"\n  {'config':>10} {'final_val':>10} {'Δ vs muon':>10} {'Δ vs look':>10}  (Δ>0 ⇒ better)")
+    best = (None, -1e9)
+    for c in cands:
+        v = _final_val(f"{results}/roles_{c}_s{seed}.json")
+        if v is None:
+            print(f"  {c:>10} {'—':>10} {'—':>10} {'—':>10}"); continue
+        dm = (muon - v) if muon is not None else float("nan")
+        dl = (look - v) if look is not None else float("nan")
+        if dm == dm and dm > best[1]:
+            best = (c, dm)
+        print(f"  {c:>10} {v:>10.4f} {dm:>+10.4f} {dl:>+10.4f}")
+    print()
+    if best[0] is None:
+        print("  VERDICT: no candidate completed.")
+    elif best[1] <= 0:
+        print("  VERDICT: no role vector beats uniform Muon → Idea 4 FALSIFIED at d6. STOP.")
+    else:
+        vl = _final_val(f"{results}/roles_{best[0]}_s{seed}.json")
+        beats_look = (look is not None and vl < look)
+        print(f"  VERDICT: best={best[0]} beats muon by {best[1]:+.4f}; "
+              f"{'ALSO beats lookahead → carry to width/scale gate.' if beats_look else 'but does NOT beat lookahead — weak.'}")
+    print()
+
+
+def e1_sweep(results, seed):
+    """E1 soft_muon_snr strength-sweep (renorm-on, the user's soft_muon_snr_probe.sh naming)."""
+    pts = ["0.0", "0.5", "1.0", "2.0", "4.0"]
+    base = _final_val(f"{results}/soft_muon_snr_sweep_s0.0_seed{seed}.json")
+    print(f"\nE1 — soft_muon_snr strength-sweep (d6/a64/b16/400, seed {seed}); baseline strength=0 = exact-SVD polar")
+    print(f"  {'strength':>9} {'final_val':>10} {'Δ=val(0)−val(·)':>16}  (Δ>0 ⇒ SNR gate helps)")
+    best = (None, 0.0)
+    for s in pts:
+        v = _final_val(f"{results}/soft_muon_snr_sweep_s{s}_seed{seed}.json")
+        if v is None:
+            print(f"  {s:>9} {'—':>10} {'—':>16}"); continue
+        d = (base - v) if base is not None else float("nan")
+        if d == d and s != "0.0" and d > best[1]:
+            best = (s, d)
+        print(f"  {s:>9} {v:>10.4f} {d:>16.4f}")
+    print()
+    if best[0] is None or best[1] <= 0:
+        print("  VERDICT: no strength>0 beats strength=0 → E1 (empirical-SNR gate) FALSIFIED at d6. STOP.")
+    else:
+        print(f"  VERDICT: strength={best[0]} beats 0 by {best[1]:.4f} → ALIVE; carry to batch×width.")
+    print()
+
+
+def _fmt(v):
+    return "—" if v is None else f"{v:.4f}"
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=("tau_sweep", "grid"))
+    ap.add_argument("mode", choices=("tau_sweep", "grid", "controls", "roles", "e1_sweep"))
     ap.add_argument("--seed", default="0")
     ap.add_argument("--tau", default="0.1", help="grid mode: the swept τ compared against τ=0")
     ap.add_argument("--results", default=DEF_RESULTS)
     a = ap.parse_args()
-    if a.mode == "tau_sweep":
-        tau_sweep(a.results, a.seed)
-    else:
-        grid(a.results, a.seed, a.tau)
+    {"tau_sweep": lambda: tau_sweep(a.results, a.seed),
+     "grid": lambda: grid(a.results, a.seed, a.tau),
+     "controls": lambda: controls(a.results, a.seed),
+     "roles": lambda: roles(a.results, a.seed),
+     "e1_sweep": lambda: e1_sweep(a.results, a.seed)}[a.mode]()
