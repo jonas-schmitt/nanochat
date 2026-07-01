@@ -121,6 +121,12 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
     _name_by_id = {id(p): n for n, p in _m.transformer.h.named_parameters()}
     role_mult = [pg.matrix_lr_mult(genome, classify_role(_name_by_id[id(p)]), p.shape[0], p.shape[1])
                  for p in mp]
+    # NOTE: the decay-geometry gene (genome.wwd_power) is DEFERRED here — it needs Shampoo-factor
+    # maintenance (L,R + inverse roots) in this eval loop, added only after the d8 scale gate confirms
+    # whitened WD holds at scale. Until then the search should be launched with wwd disabled (its cost
+    # is already priced in extra_matmuls, so an unwired wwd_power>0 genome is just penalized, not used).
+    if genome.wwd_power > 0:
+        raise NotImplementedError("wwd_power search wiring pending d8 gate; launch search with wwd off")
     from gns.temporal_grammar import init_state as tg_init, lookahead_sync as tg_la_sync
     st_all = [tg_init(genome.temporal, p) for p in model.parameters()]
 

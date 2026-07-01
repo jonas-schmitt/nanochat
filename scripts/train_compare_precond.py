@@ -114,6 +114,7 @@ def parse_args():
     # The whitened decay is NORM-MATCHED to ||W|| (pure geometry change, not a lambda rescale => the swept-scalar-lr
     # control is the real threat). strength blends: 0 == plain Muon WD (clean ablation), 1 == fully whitened.
     p.add_argument("--wwd-strength", type=float, default=1.0, help="muon_wwd: blend 0(iso)..1(whitened)")
+    p.add_argument("--wwd-power", type=float, default=0.5, help="muon_wwd: decay metric power p in L^-p·W·R^-p (0/0.25/0.5/0.75; 0=iso)")
     # subspace_newton (Idea 2): global tiny-subspace second-order over the concatenated matrix-param momenta.
     p.add_argument("--subspace-k", type=int, default=32, help="subspace_newton: subspace dim k")
     p.add_argument("--subspace-refresh", type=int, default=16, help="subspace_newton: SVD refresh interval")
@@ -705,11 +706,16 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                 # Cosine-annealed weight decay (matching production base_train.py:get_weight_decay)
                 cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / args.num_iterations))
                 wd_target = None
-                if arm == "muon_wwd" and st.get("Linv") is not None:
-                    # whitened decay target: L^-1/2 p R^-1/2 (Linv=L^-1/4 => Linv@Linv=L^-1/2), NORM-MATCHED
-                    # to ||p|| (pure geometry, not a λ rescale), blended by strength (0=iso, 1=whitened).
-                    Lh, Rh = st["Linv"] @ st["Linv"], st["Rinv"] @ st["Rinv"]
-                    pw = (Lh @ p.float()) @ Rh
+                if arm == "muon_wwd" and st.get("Linv") is not None and args.wwd_power > 0:
+                    # whitened decay target: L^-p · W · R^-p (Linv=L^-1/4, so k=round(4p) applications each
+                    # side give L^-{k/4}), NORM-MATCHED to ||W|| (pure geometry, not a λ rescale), then blended
+                    # by strength (0=iso, 1=whitened). power=0.5 (k=2)=full whitening; 0.25=gentle; 0.75=strong.
+                    k = int(round(args.wwd_power * 4))
+                    pw = p.float()
+                    for _ in range(k):
+                        pw = st["Linv"] @ pw
+                    for _ in range(k):
+                        pw = pw @ st["Rinv"]
                     pw = pw * (p.float().norm() / pw.norm().clamp_min(1e-12))
                     s = args.wwd_strength
                     wd_target = ((1 - s) * p.float() + s * pw).to(p.dtype)
@@ -811,7 +817,7 @@ def main():
                    "ns_steps", "weight_decay", "momentum", "beta2",
                    "warmup_steps", "n_val_batches", "eval_every",
                    "soft_tau", "soft_q", "soft_mode", "snr_strength", "soft_no_renorm", "role_lr_mults",
-                   "anderson_window", "anderson_reg", "anderson_restart", "wwd_strength")
+                   "anderson_window", "anderson_reg", "anderson_restart", "wwd_strength", "wwd_power")
             if [pc.get(k, cfg[k]) for k in sig] == [cfg[k] for k in sig]:
                 done = prev.get("_done", {})
                 if done:
