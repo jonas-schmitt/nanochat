@@ -115,6 +115,12 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
     mp = matrix_params(model); mp_set = {id(p) for p in mp}
     adam = _build_other_adam(model, mp_set)
     st_mp = [pg.init_state(genome, p) for p in mp]
+    # COORDINATION genes: per-matrix LR multiplier from role_scales × optional μP RMS (scalars, iso-FLOP).
+    from gns.module_lr import classify_role
+    _m = getattr(model, "_orig_mod", model)
+    _name_by_id = {id(p): n for n, p in _m.transformer.h.named_parameters()}
+    role_mult = [pg.matrix_lr_mult(genome, classify_role(_name_by_id[id(p)]), p.shape[0], p.shape[1])
+                 for p in mp]
     from gns.temporal_grammar import init_state as tg_init, lookahead_sync as tg_la_sync
     st_all = [tg_init(genome.temporal, p) for p in model.parameters()]
 
@@ -129,7 +135,7 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
                 if p.grad is None: continue
                 D = pg.program_step(genome, p.grad, st_mp[j], step, polar_fn)
                 if not torch.isfinite(D).all(): return float("inf")
-                apply_norm_caution_update(D, p, st_mp[j], args.lr * lrm, cos_wd, args.beta2)
+                apply_norm_caution_update(D, p, st_mp[j], args.lr * lrm * role_mult[j], cos_wd, args.beta2)
         for gp in adam.param_groups: gp["lr"] = gp["base_lr"] * lrm
         adam.step()
         for pi, p in enumerate(model.parameters()):
