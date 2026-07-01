@@ -25,7 +25,21 @@ import numpy as np
 import torch
 
 from train_compare_precond import (build_model, matrix_params, apply_norm_caution_update,
-                                    polar_express_orth, _polar_with_coeffs, _build_other_adam)
+                                    polar_express_orth, _polar_with_coeffs, _build_other_adam,
+                                    inv_fourth_root)
+
+# Whitened weight decay / curvature-descent reuse the Shampoo factors; the inverse-root refresh interval is
+# an optimizable gene (genome.recompute_every) since the decay metric tolerates stale factors (rc100 held the
+# +0.0137 at ~1.05x wall in the recompute sweep). See gns.program_grammar RECOMPUTE_MENU.
+def _wwd_target(p, Linv, Rinv, power):
+    """Norm-matched whitened decay target L^-p·W·R^-p (Linv=L^-1/4 ⇒ k=round(4p) applications each side)."""
+    k = int(round(power * 4))
+    pw = p.float()
+    for _ in range(k):
+        pw = Linv @ pw
+    for _ in range(k):
+        pw = pw @ Rinv
+    return (pw * (p.float().norm() / pw.norm().clamp_min(1e-12))).to(p.dtype)
 from nanochat.tokenizer import get_tokenizer
 from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bos_bestfit
 from gns import program_grammar as pg
@@ -121,12 +135,14 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
     _name_by_id = {id(p): n for n, p in _m.transformer.h.named_parameters()}
     role_mult = [pg.matrix_lr_mult(genome, classify_role(_name_by_id[id(p)]), p.shape[0], p.shape[1])
                  for p in mp]
-    # NOTE: the decay-geometry gene (genome.wwd_power) is DEFERRED here — it needs Shampoo-factor
-    # maintenance (L,R + inverse roots) in this eval loop, added only after the d8 scale gate confirms
-    # whitened WD holds at scale. Until then the search should be launched with wwd disabled (its cost
-    # is already priced in extra_matmuls, so an unwired wwd_power>0 genome is just penalized, not used).
-    if genome.wwd_power > 0:
-        raise NotImplementedError("wwd_power search wiring pending d8 gate; launch search with wwd off")
+    # Factor family (genome.wwd_power>0 and/or curvature_descent): maintain Shampoo factors L,R + inverse roots
+    # refreshed every genome.recompute_every (the decay metric tolerates stale factors). Factors feed the DESCENT
+    # (curvature_descent: precondition g → Linv·g·Rinv before program_step) and/or the DECAY (whitened WD).
+    use_fac = genome.wwd_power > 0 or genome.curvature_descent
+    rc = max(1, genome.recompute_every)
+    fac = ([{"L": torch.zeros(p.shape[0], p.shape[0], device=p.device),
+             "R": torch.zeros(p.shape[1], p.shape[1], device=p.device),
+             "Linv": None, "Rinv": None} for p in mp] if use_fac else None)
     from gns.temporal_grammar import init_state as tg_init, lookahead_sync as tg_la_sync
     st_all = [tg_init(genome.temporal, p) for p in model.parameters()]
 
@@ -139,9 +155,24 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
         with torch.no_grad():
             for j, p in enumerate(mp):
                 if p.grad is None: continue
-                D = pg.program_step(genome, p.grad, st_mp[j], step, polar_fn)
+                fj = fac[j] if use_fac else None
+                if use_fac:                                   # update factors BEFORE the descent uses them
+                    gf = p.grad.float()
+                    fj["L"].mul_(0.95).add_(gf @ gf.t(), alpha=0.05)
+                    fj["R"].mul_(0.95).add_(gf.t() @ gf, alpha=0.05)
+                    if step >= args.warmup_steps and (fj["Linv"] is None or step % rc == 0):
+                        fj["Linv"] = inv_fourth_root(fj["L"], 1e-4, 24)
+                        fj["Rinv"] = inv_fourth_root(fj["R"], 1e-4, 24)
+                grad_in = p.grad
+                if genome.curvature_descent and fj is not None and fj["Linv"] is not None:
+                    grad_in = ((fj["Linv"] @ p.grad.float()) @ fj["Rinv"]).to(p.grad.dtype)  # ortho_shampoo dir
+                D = pg.program_step(genome, grad_in, st_mp[j], step, polar_fn)
                 if not torch.isfinite(D).all(): return float("inf")
-                apply_norm_caution_update(D, p, st_mp[j], args.lr * lrm * role_mult[j], cos_wd, args.beta2)
+                wd_target = None
+                if genome.wwd_power > 0 and fj is not None and fj["Linv"] is not None:
+                    wd_target = _wwd_target(p, fj["Linv"], fj["Rinv"], genome.wwd_power)
+                apply_norm_caution_update(D, p, st_mp[j], args.lr * lrm * role_mult[j], cos_wd, args.beta2,
+                                          wd_target=wd_target)
         for gp in adam.param_groups: gp["lr"] = gp["base_lr"] * lrm
         adam.step()
         for pi, p in enumerate(model.parameters()):
