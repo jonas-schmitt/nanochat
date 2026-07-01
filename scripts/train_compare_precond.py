@@ -109,6 +109,11 @@ def parse_args():
     p.add_argument("--anderson-window", type=int, default=5, help="muon_anderson_win: Anderson window m (0=off=muon)")
     p.add_argument("--anderson-reg", type=float, default=1e-8, help="muon_anderson_win: Tikhonov ridge on the LS solve")
     p.add_argument("--anderson-restart", type=int, default=0, help="muon_anderson_win: restart interval (0=never)")
+    # muon_wwd (WHITENED WEIGHT DECAY): decay in the Shampoo-factor metric W - lr*wd*(L^-1/2 W R^-1/2)
+    # instead of isotropic W - lr*wd*W. The one axis neither Muon nor AdamW touches (both decay isotropically).
+    # The whitened decay is NORM-MATCHED to ||W|| (pure geometry change, not a lambda rescale => the swept-scalar-lr
+    # control is the real threat). strength blends: 0 == plain Muon WD (clean ablation), 1 == fully whitened.
+    p.add_argument("--wwd-strength", type=float, default=1.0, help="muon_wwd: blend 0(iso)..1(whitened)")
     # subspace_newton (Idea 2): global tiny-subspace second-order over the concatenated matrix-param momenta.
     p.add_argument("--subspace-k", type=int, default=32, help="subspace_newton: subspace dim k")
     p.add_argument("--subspace-refresh", type=int, default=16, help="subspace_newton: SVD refresh interval")
@@ -273,14 +278,17 @@ def inv_fourth_root(L, ridge, k, prec=Prec.fp32, orders=None):
 
 
 # ----------------------------- shared post-direction machinery (Muon's) -----------------------------
-def apply_norm_caution_update(D, p, st, lr, wd, beta2, no_renorm=False):
+def apply_norm_caution_update(D, p, st, lr, wd, beta2, no_renorm=False, wd_target=None):
     """NorMuon variance reduction + cautious WD/update, lifted from muon_step_unfused (per-param).
     `D` is the arm's already-Nesterov-smoothed direction; this is identical across all arms.
     `no_renorm` (Bet B E3): skip NorMuon's cross-direction renorm and apply the cautious WD update on
-    `D` directly — so a spectral gate's effect is measured un-masked. Default False == unchanged."""
+    `D` directly — so a spectral gate's effect is measured un-masked. Default False == unchanged.
+    `wd_target` (muon_wwd): the tensor the decay shrinks toward zero (default `p`). Passing the
+    norm-matched whitened param `L^-1/2 p R^-1/2` decays in the curvature metric; None == plain WD."""
+    wdt = p if wd_target is None else wd_target
     if no_renorm:
         mask = (D * p) >= 0
-        p.sub_((lr * D + lr * wd * p * mask).to(p.dtype))
+        p.sub_((lr * D + lr * wd * wdt * mask).to(p.dtype))
         return
     red_dim = -1 if p.shape[-2] >= p.shape[-1] else -2
     g = D
@@ -296,7 +304,7 @@ def apply_norm_caution_update(D, p, st, lr, wd, beta2, no_renorm=False):
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
     mask = (g * p) >= 0
-    p.sub_((lr * g + lr * wd * p * mask).to(p.dtype))
+    p.sub_((lr * g + lr * wd * wdt * mask).to(p.dtype))
 
 
 def _nesterov(grad, st, momentum):
@@ -449,10 +457,11 @@ def direction(arm, p, st, grad, args, step):
         return gm
     if arm == "sgd":
         return gm
-    if arm in ("muon", "muon_lookahead", "muon_anderson_win"):
+    if arm in ("muon", "muon_lookahead", "muon_anderson_win", "muon_wwd"):
         # muon_lookahead: same direction, lookahead wrapper in run_arm.
         # muon_anderson_win (N3): same plain-Muon direction; the GLOBAL Anderson correction over the
         # concatenated matrix-param iterate is applied in run_arm (after the plain step is taken).
+        # muon_wwd: same plain-Muon direction; only the WEIGHT-DECAY term is whitened (in run_arm).
         return polar_express_orth(gm, args.ns_steps)
     if arm == "muon_track":  # Idea 1: incremental orthogonalization (dynamic polar tracking).
         # Warm-starts the polar across steps from per-param state st["ipolar_S"]; ~1 NS step per step
@@ -618,7 +627,7 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
               "Linv": None, "Rinv": None, "kappa": 1.0,
               "Q_L": None, "Q_R": None, "msoap": None, "vsoap": None} for p in mp]
     needs_factors = arm in ("shampoo", "ortho_shampoo", "layer_adaptive", "synth", "soap",
-                            "eigenbasis_shampoo")
+                            "eigenbasis_shampoo", "muon_wwd")
     # P-temporal (2026-06-29): Lookahead (Zhang et al. 2019) wraps any base arm — a ~free convergence
     # accelerator (no extra matmuls). Every k steps the slow weights move alpha toward the fast weights
     # and the fast weights reset to slow. Tests whether a TEMPORAL primitive (not curvature) gives a
@@ -695,8 +704,17 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                     D = p.grad.lerp(st["mom"], args.momentum)
                 # Cosine-annealed weight decay (matching production base_train.py:get_weight_decay)
                 cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / args.num_iterations))
+                wd_target = None
+                if arm == "muon_wwd" and st.get("Linv") is not None:
+                    # whitened decay target: L^-1/2 p R^-1/2 (Linv=L^-1/4 => Linv@Linv=L^-1/2), NORM-MATCHED
+                    # to ||p|| (pure geometry, not a λ rescale), blended by strength (0=iso, 1=whitened).
+                    Lh, Rh = st["Linv"] @ st["Linv"], st["Rinv"] @ st["Rinv"]
+                    pw = (Lh @ p.float()) @ Rh
+                    pw = pw * (p.float().norm() / pw.norm().clamp_min(1e-12))
+                    s = args.wwd_strength
+                    wd_target = ((1 - s) * p.float() + s * pw).to(p.dtype)
                 apply_norm_caution_update(D, p, st, lr * lrm * roles_vec[j], cos_wd, args.beta2,
-                                          no_renorm=_soft_no_renorm)
+                                          no_renorm=_soft_no_renorm, wd_target=wd_target)
             if anderson is not None:  # N3: global Anderson correction over the concatenated matrix iterate
                 x_new = torch.cat([p.detach().reshape(-1) for p in mp]).float()
                 x_acc = anderson.step(x_prev, x_new - x_prev)   # f = the plain Muon step just taken
@@ -793,7 +811,7 @@ def main():
                    "ns_steps", "weight_decay", "momentum", "beta2",
                    "warmup_steps", "n_val_batches", "eval_every",
                    "soft_tau", "soft_q", "soft_mode", "snr_strength", "soft_no_renorm", "role_lr_mults",
-                   "anderson_window", "anderson_reg", "anderson_restart")
+                   "anderson_window", "anderson_reg", "anderson_restart", "wwd_strength")
             if [pc.get(k, cfg[k]) for k in sig] == [cfg[k] for k in sig]:
                 done = prev.get("_done", {})
                 if done:
