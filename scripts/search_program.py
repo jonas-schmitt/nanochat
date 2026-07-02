@@ -45,6 +45,7 @@ from nanochat.dataloader import tokenizing_distributed_data_loader_with_state_bo
 from gns import program_grammar as pg
 from gns.program_grammar import POLAR_MENU, PolarVariant
 from gns.search import fast_nondominated_sort, _rank_and_crowd
+from gns.temporal_stability import is_temporally_stable
 
 
 def _cfg():
@@ -239,6 +240,13 @@ def main():
     def objs_of(g) -> tuple[float, float]:
         key = pg.canonical(g)
         if key not in seen:
+            # v2 CPU surrogate (kill-only): prune provably-resonant recurrences before any GPU.
+            ok_stab, z_star = is_temporally_stable(g)
+            if not ok_stab:
+                seen[key] = (float("inf"), g.extra_matmuls()); genomes[key] = g
+                print(f"  PRUNED-CPU (stability envelope z*={z_star:.2f} too small for lr_scale "
+                      f"{g.lr_scale:g})  {key}", flush=True)
+                return seen[key]
             t0 = time.time()
             res = train_genome(ctx, g, args, screen=(200, best200[0], 0.35))
             c = g.extra_matmuls()                    # polar-matmul cost over Muon (cheaper < 0)
