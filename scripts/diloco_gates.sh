@@ -5,6 +5,10 @@ set -e
 cd /home/jonas/git/nanochat
 export PYTHONPATH=/home/jonas/git/nanochat:/home/jonas/git/gns/src
 export PYTHONUNBUFFERED=1
+# bit-reproducible mode: the gates compare val traces for EQUALITY, and the harness's normal
+# run-to-run nondeterminism (~6e-3, measured gate_ga3a vs gate_ga3a_repeat) would swamp them
+export GNS_DETERMINISTIC=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 RUN="uv run --project /home/jonas/git/tct-models python"
 R=/home/jonas/git/gns/results
 N=300

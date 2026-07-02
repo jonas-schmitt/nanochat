@@ -37,9 +37,10 @@ def _compare(name, a, b, tol):
 def main():
     muon, lookahead, ga1, ga2, ga3a, ga3b = sys.argv[1:7]
     ok = True
-    # bit-exactness is the design intent; tolerate only float-noise-level drift
-    ok &= _compare("G-A1 (diloco==muon)", _trace(ga1), _trace(muon, "muon"), tol=2e-3)
-    ok &= _compare("G-A2 (diloco==lookahead)", _trace(ga2), _trace(lookahead, "muon_lookahead"), tol=2e-3)
+    # runs are deterministic (GNS_DETERMINISTIC=1 in diloco_gates.sh) and the simulator computes
+    # deltas/outer updates in fp32 where the round-trip is exact -> the gates demand bit-equality
+    ok &= _compare("G-A1 (diloco==muon)", _trace(ga1), _trace(muon, "muon"), tol=0.0)
+    ok &= _compare("G-A2 (diloco==lookahead)", _trace(ga2), _trace(lookahead, "muon_lookahead"), tol=0.0)
     ok &= _compare("G-A3 (bits32 inert)", _trace(ga3a), _trace(ga3b), tol=0.0)
     print("ALL GATES PASS" if ok else "GATE FAILURE")
     sys.exit(0 if ok else 1)

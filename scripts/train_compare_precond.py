@@ -774,6 +774,15 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    if os.environ.get("GNS_DETERMINISTIC") == "1":
+        # Bit-reproducible mode for the DiLoCo-simulator equivalence gates (G-A1/G-A2): kills the
+        # measured ~6e-3 run-to-run spread (atomicAdd backward, flash-SDPA) so "equal" is decidable.
+        # Requires CUBLAS_WORKSPACE_CONFIG=:4096:8 in the env. Slower; NOT for production sweeps.
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        print("[deterministic] GNS_DETERMINISTIC=1: deterministic algorithms + math SDPA")
     tok = get_tokenizer(); vocab = tok.get_vocab_size()
 
     def materialise(split, n, resume_state_dict=None):

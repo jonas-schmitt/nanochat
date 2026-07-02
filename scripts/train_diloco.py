@@ -336,6 +336,14 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    import os
+    if os.environ.get("GNS_DETERMINISTIC") == "1":
+        # same hook as train_compare_precond: bit-reproducible mode for the equivalence gates
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        print("[deterministic] GNS_DETERMINISTIC=1: deterministic algorithms + math SDPA")
     genome = build_genome(args)
     print(f"policy: {canonical(genome)}")
     print(f"comm: {genome.comm_bits_per_param_step():.4f} bits/param/step "
