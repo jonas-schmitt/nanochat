@@ -15,6 +15,11 @@ export PYTHONUNBUFFERED=1
 RUN="uv run --project /home/jonas/git/tct-models python"
 R=/home/jonas/git/gns/results
 
+# automatic logging: everything mirrored to a timestamped log (live output preserved via tee)
+LOG=$R/g2_search_$(date +%Y%m%d_%H%M%S).log
+exec > >(tee -a "$LOG") 2>&1
+echo "logging to $LOG"
+
 echo "=== G2 Stage-1 search (pop ${POP:-20}, gens ${GENS:-7}, steps ${STEPS:-700})"
 $RUN scripts/search_program.py --depth 6 --steps "${STEPS:-700}" --pop "${POP:-20}" \
   --gens "${GENS:-7}" --lr 0.02 --weight-decay 0.28 --seed "${SEED:-0}" \
