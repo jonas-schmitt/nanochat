@@ -84,7 +84,8 @@ def main():
             print(f"[d{d} s{s}] context built ({time.time()-t0:.0f}s)", flush=True)
             for lab, g in cands.items():
                 tg = time.time()
-                v = train_genome(ctx, g, args)
+                res = train_genome(ctx, g, args)   # dict since the ema-densification upgrade
+                v = res[g.eval_ema_beta] if isinstance(res, dict) else res
                 vals[lab][d].append(v)
                 print(f"  [d{d} s{s}] {lab:14s} val {v:.4f}  ({time.time()-tg:.0f}s)", flush=True)
             del ctx

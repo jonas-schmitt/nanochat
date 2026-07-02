@@ -113,7 +113,7 @@ def build_context(args, depth: int, seed: int, steps: int, compile_: bool = True
                                  val=val, polar_fn=_make_polar_fn(), depth=depth, seed=seed)
 
 
-def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
+def train_genome(ctx, genome: pg.ProgramGenome, args, screen=None) -> dict:
     """Train ``genome`` from ctx's init snapshot over ctx.train; return mean val loss.
 
     Identical optimizer math to the previous evaluate(): per-matrix-param temporal state +
@@ -145,10 +145,11 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
              "Linv": None, "Rinv": None} for p in mp] if use_fac else None)
     from gns.temporal_grammar import init_state as tg_init, lookahead_sync as tg_la_sync
     st_all = [tg_init(genome.temporal, p) for p in model.parameters()]
-    # eval-EMA gene: free bias-corrected weight EMA, scored INSTEAD of the raw weights when the
-    # genome declares it (search decides per-genome; hurts lookahead-style genomes, helps plain ones).
-    ema = ([p.detach().float().clone().zero_() for p in model.parameters()]
-           if genome.eval_ema_beta > 0 else None)
+    # L3 (ema-axis densification): the eval-EMA gene does not affect TRAINING, so one trained run
+    # yields the fitness of all three protocol siblings (raw + both EMA betas) — two extra fp32
+    # buffers, ~zero extra time; the search caches all siblings from one GPU run.
+    ema_betas = [b for b in pg.EVAL_EMA_MENU if b > 0]
+    emas = {b: [p.detach().float().clone().zero_() for p in model.parameters()] for b in ema_betas}
 
     for step in range(1, steps + 1):
         x, y = train[step - 1]
@@ -183,20 +184,34 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
         for pi, p in enumerate(model.parameters()):
             with torch.no_grad():
                 tg_la_sync(genome.temporal, p, st_all[pi], step)
-        if ema is not None:
-            with torch.no_grad():
-                b = genome.eval_ema_beta
-                for e, p in zip(ema, model.parameters()):
+        with torch.no_grad():
+            for b, bufs in emas.items():
+                for e, p in zip(bufs, model.parameters()):
                     e.mul_(b).add_(p.detach().float(), alpha=1 - b)
+        # L2 disaster screen (margin calibrated from measured rank-inversion data: inversions reach
+        # ~0.2-0.4, so this only kills GARBAGE, never sorts contenders). screen = (step, best, margin).
+        if screen is not None and step == screen[0]:
+            model.eval()
+            with torch.no_grad():
+                v200 = float(np.mean([float(model(vx, vy).item()) for vx, vy in val[:4]]))
+            model.train()
+            if screen[1] is not None and v200 > screen[1] + screen[2]:
+                return {"pruned": True, "screen_val": v200}
+            screen_out = v200
     model.eval()
+    out = {"_v200": locals().get("screen_out")}
     with torch.no_grad():
-        if ema is not None:  # score the genome's declared eval protocol
-            corr = 1.0 - genome.eval_ema_beta ** steps
-            for e, p in zip(ema, model.parameters()):
+        backup = [p.detach().clone() for p in model.parameters()]
+        out[0.0] = float(np.mean([float(model(vx, vy).item()) for vx, vy in val]))
+        for b, bufs in emas.items():
+            corr = 1.0 - b ** steps
+            for e, p in zip(bufs, model.parameters()):
                 p.data.copy_((e / corr).to(p.dtype))
-        vl = float(np.mean([float(model(vx, vy).item()) for vx, vy in val]))
+            out[b] = float(np.mean([float(model(vx, vy).item()) for vx, vy in val]))
+            for bk, p in zip(backup, model.parameters()):
+                p.data.copy_(bk)
     model.train()
-    return vl
+    return out
 
 
 def main():
@@ -219,15 +234,27 @@ def main():
 
     seen: dict[str, tuple[float, float]] = {}       # canonical -> (val, cost)
     genomes: dict[str, pg.ProgramGenome] = {}       # canonical -> genome object
+    best200 = [None]                                 # running best step-200 val (disaster screen)
 
     def objs_of(g) -> tuple[float, float]:
         key = pg.canonical(g)
         if key not in seen:
             t0 = time.time()
-            v = train_genome(ctx, g, args)
+            res = train_genome(ctx, g, args, screen=(200, best200[0], 0.35))
             c = g.extra_matmuls()                    # polar-matmul cost over Muon (cheaper < 0)
-            seen[key] = (v, c); genomes[key] = g
-            print(f"  val {v:.4f}  cost {c:+.3f}  ({time.time()-t0:.0f}s)  {key}", flush=True)
+            if res.get("pruned"):
+                seen[key] = (float("inf"), c); genomes[key] = g
+                print(f"  PRUNED@200 (val {res['screen_val']:.3f} > best+0.35)  {key}", flush=True)
+            else:
+                if res.get("_v200") is not None:
+                    best200[0] = res["_v200"] if best200[0] is None else min(best200[0], res["_v200"])
+                # L3: one trained run prices ALL eval-EMA siblings — cache every protocol variant
+                from dataclasses import replace as _dcr
+                for b in [x for x in res if isinstance(x, float)]:
+                    sib = _dcr(g, eval_ema_beta=b)
+                    seen[pg.canonical(sib)] = (res[b], c); genomes[pg.canonical(sib)] = sib
+                print(f"  val {seen[key][0]:.4f} (ema0 {res[0.0]:.4f} / .99 {res[0.99]:.4f} / "
+                      f".999 {res[0.999]:.4f})  cost {c:+.3f}  ({time.time()-t0:.0f}s)  {key}", flush=True)
         return seen[key]
 
     def val_of(g):  return objs_of(g)[0]
