@@ -155,7 +155,8 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
         loss = model(x, y)
         model.zero_grad(set_to_none=True); adam.zero_grad(set_to_none=True); loss.backward()
         lrm = min(1.0, step / max(1, args.warmup_steps))
-        cos_wd = args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / steps))
+        # wd_scale gene: the genome owns its decay STRENGTH (shape = wwd_power); base lambda from args
+        cos_wd = genome.wd_scale * args.weight_decay * 0.5 * (1 + math.cos(math.pi * step / steps))
         with torch.no_grad():
             for j, p in enumerate(mp):
                 if p.grad is None: continue
@@ -175,9 +176,9 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
                 wd_target = None
                 if genome.wwd_power > 0 and fj is not None and fj["Linv"] is not None:
                     wd_target = _wwd_target(p, fj["Linv"], fj["Rinv"], genome.wwd_power)
-                apply_norm_caution_update(D, p, st_mp[j], args.lr * lrm * role_mult[j], cos_wd, args.beta2,
+                apply_norm_caution_update(D, p, st_mp[j], genome.lr_scale * args.lr * lrm * role_mult[j], cos_wd, args.beta2,
                                           wd_target=wd_target)
-        for gp in adam.param_groups: gp["lr"] = gp["base_lr"] * lrm
+        for gp in adam.param_groups: gp["lr"] = genome.adam_lr_scale * gp["base_lr"] * lrm
         adam.step()
         for pi, p in enumerate(model.parameters()):
             with torch.no_grad():
