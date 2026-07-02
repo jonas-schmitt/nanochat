@@ -145,6 +145,10 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
              "Linv": None, "Rinv": None} for p in mp] if use_fac else None)
     from gns.temporal_grammar import init_state as tg_init, lookahead_sync as tg_la_sync
     st_all = [tg_init(genome.temporal, p) for p in model.parameters()]
+    # eval-EMA gene: free bias-corrected weight EMA, scored INSTEAD of the raw weights when the
+    # genome declares it (search decides per-genome; hurts lookahead-style genomes, helps plain ones).
+    ema = ([p.detach().float().clone().zero_() for p in model.parameters()]
+           if genome.eval_ema_beta > 0 else None)
 
     for step in range(1, steps + 1):
         x, y = train[step - 1]
@@ -178,8 +182,17 @@ def train_genome(ctx, genome: pg.ProgramGenome, args) -> float:
         for pi, p in enumerate(model.parameters()):
             with torch.no_grad():
                 tg_la_sync(genome.temporal, p, st_all[pi], step)
+        if ema is not None:
+            with torch.no_grad():
+                b = genome.eval_ema_beta
+                for e, p in zip(ema, model.parameters()):
+                    e.mul_(b).add_(p.detach().float(), alpha=1 - b)
     model.eval()
     with torch.no_grad():
+        if ema is not None:  # score the genome's declared eval protocol
+            corr = 1.0 - genome.eval_ema_beta ** steps
+            for e, p in zip(ema, model.parameters()):
+                p.data.copy_((e / corr).to(p.dtype))
         vl = float(np.mean([float(model(vx, vy).item()) for vx, vy in val]))
     model.train()
     return vl
