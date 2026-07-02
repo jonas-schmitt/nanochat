@@ -42,4 +42,22 @@ for S in 1 2; do
     --out $R/wwd_rc100_s${S}.json
 done
 
+# --- deferred probe arms (validation value only after H2 closed; reordered behind Q1-Q4
+#     on 2026-07-02 owner request: decision-relevant experiments first) ---
+COMMON="--depth 6 --num-iterations 1500 --matrix-lr 0.02 --eval-every 100"
+echo "=== P4: DP anchor (muon at M*batch)"
+$RUN scripts/train_compare_precond.py --depth 6 --num-iterations 1500 --arms muon \
+  --device-batch-size 64 --matrix-lr-grid 0.02 --eval-every 100 --out $R/probe_dp_anchor64.json
+echo "=== P5: DiLoCo baseline (AdamW-inner)"
+$RUN scripts/train_diloco.py $COMMON --workers 4 --preset diloco --matrix-lr 0.003 \
+  --out $R/probe_diloco_adamw.json
+echo "=== P6: MuLoCo 2-bit + EF"
+$RUN scripts/train_diloco.py $COMMON --workers 4 --preset muloco2bit --out $R/probe_muloco_2bit.json
+echo "=== P7: whiten-vs-rotate (2-bit hadamard)"
+$RUN scripts/train_diloco.py $COMMON --workers 4 --preset muloco2bit --basis hadamard \
+  --out $R/probe_hadamard_2bit.json
+echo "=== P8: comm curve h=100"
+$RUN scripts/train_diloco.py $COMMON --workers 4 --preset muloco --h 100 --out $R/probe_muloco_h100.json
+
+$RUN scripts/analyze_diloco_probe.py || true
 echo "INNER-LOOP QUEUE COMPLETE"
