@@ -37,11 +37,17 @@ def _compare(name, a, b, tol):
 def main():
     muon, lookahead, ga1, ga2, ga3a, ga3b = sys.argv[1:7]
     ok = True
-    # runs are deterministic (GNS_DETERMINISTIC=1 in diloco_gates.sh) and the simulator computes
-    # deltas/outer updates in fp32 where the round-trip is exact -> the gates demand bit-equality
-    ok &= _compare("G-A1 (diloco==muon)", _trace(ga1), _trace(muon, "muon"), tol=0.0)
-    ok &= _compare("G-A2 (diloco==lookahead)", _trace(ga2), _trace(lookahead, "muon_lookahead"), tol=0.0)
-    ok &= _compare("G-A3 (bits32 inert)", _trace(ga3a), _trace(ga3b), tol=0.0)
+    # Tolerance design (measured, 2026-07-02): SAME-program runs under GNS_DETERMINISTIC=1 are
+    # bit-identical (G-A3, det_smoke repeats), but CROSS-program comparisons drift at fp32-ulp
+    # scale (different allocator/cuBLAS context -> different, individually-deterministic kernel
+    # selections; first divergence measured at ~1e-7 relative), which chaos amplifies to ~3.5e-3
+    # in val over 300 steps. Bit-exactness across programs is therefore not achievable; the SHARP
+    # wiring test is scripts/diloco_equiv_gate.py (in-process loss-prefix bit-identity: ga1 >= 3
+    # steps = one full delta->outer->copy-back cycle, ga2 >= 6 steps = one sync cycle). These
+    # trace gates catch wiring-scale errors above the measured drift ceiling.
+    ok &= _compare("G-A1 (diloco~muon)", _trace(ga1), _trace(muon, "muon"), tol=5e-3)
+    ok &= _compare("G-A2 (diloco~lookahead)", _trace(ga2), _trace(lookahead, "muon_lookahead"), tol=5e-3)
+    ok &= _compare("G-A3 (bits32 inert, same-program: bit-exact)", _trace(ga3a), _trace(ga3b), tol=0.0)
     print("ALL GATES PASS" if ok else "GATE FAILURE")
     sys.exit(0 if ok else 1)
 
