@@ -116,6 +116,9 @@ def parse_args():
     p.add_argument("--outer-factor-beta", type=float, default=0.9, help="EMA over rounds for outer L,R")
     p.add_argument("--outer-factor-ridge", type=float, default=1e-4)
     p.add_argument("--outer-factor-coupled-steps", type=int, default=24)
+    p.add_argument("--outer-whiten-guard", action="store_true",
+                   help="stability guard for the whitened outer step (fallback to raw delta on "
+                        "non-finite or cosine<0.1 directions); the pre-registered blowup fix")
     return p.parse_args()
 
 
@@ -193,7 +196,19 @@ def _outer_transform_fn(genome, args, outer_factors):
                 d = st["Linv"] @ d
             for _ in range(k):
                 d = d @ st["Rinv"]
-            return d * (delta.norm() / d.norm().clamp_min(1e-12))
+            d = d * (delta.norm() / d.norm().clamp_min(1e-12))
+            if args.outer_whiten_guard:
+                # STABILITY GUARD (pre-registered follow-up to the step-1020 blowup of the unguarded
+                # run): late in training the factors are built from SHRINKING deltas, so the inverse
+                # roots amplify noise — the exact failure mode of the inner curvature-DESCENT. Fall
+                # back to the raw delta when the whitened direction disagrees with it (cosine < 0.1)
+                # or is non-finite. One guarded rerun decides the arm; no further variants.
+                if not torch.isfinite(d).all():
+                    return delta
+                cos = (d * delta).sum() / (d.norm() * delta.norm()).clamp_min(1e-12)
+                if cos < 0.1:
+                    return delta
+            return d
         raise ValueError(name)
 
     return fn

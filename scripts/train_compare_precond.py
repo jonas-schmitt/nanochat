@@ -166,6 +166,16 @@ def parse_args():
     p.add_argument("--soap-beta2", type=float, default=0.99, help="SOAP second-moment EMA (Adam-typical).")
     p.add_argument("--n-val-batches", type=int, default=16)
     p.add_argument("--eval-every", type=int, default=50)
+    # EMA-eval CONFOUND GATE (fused-track fallout, 2026-07-02): Lookahead's slow weights ≈ implicit
+    # weight averaging, which is FREE and standard (Polyak/LAWA). Before any temporal-lever claim,
+    # tuned-Muon + EMA-eval must NOT close the Lookahead/knee0 gap. beta>0 tracks a bias-corrected
+    # EMA of ALL params and logs val_ema alongside val at every eval (training itself untouched).
+    p.add_argument("--ema-eval-beta", type=float, default=0.0,
+                   help="0=off; e.g. 0.999: also evaluate the EMA of the weights (val_ema in the curve)")
+    # DATA-REPETITION sweep (WWD regularizer-identity gate): repeat the first ceil(n/N) train batches
+    # N times (multi-epoch regime). WWD's mechanism predicts its edge GROWS with repetition.
+    p.add_argument("--data-repeat", type=int, default=1,
+                   help="1=off; N>1: train on ceil(num_iterations/N) unique batches cycled N times")
     p.add_argument("--arms", type=str, default="muon,shampoo,ortho_shampoo,layer_adaptive,sgd")
     p.add_argument("--polar-coeffs", type=str, default="",
                    help="③ searched_polar arm: ';'-separated 'a,b,c' Gram-poly triples")
@@ -648,6 +658,11 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                    if subspace else None)
 
     log = {"step": [], "val": [], "wall_ms": []}
+    # EMA-eval confound gate: bias-corrected weight EMA, evaluated alongside the raw weights.
+    ema = ([p.detach().float().clone().zero_() for p in model.parameters()]
+           if args.ema_eval_beta > 0 else None)
+    if ema is not None:
+        log["val_ema"] = []
     ev_start = torch.cuda.Event(enable_timing=True); ev_start.record()
     for step in range(1, args.num_iterations + 1):
         x, y = train_batches[step - 1]
@@ -745,17 +760,32 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
                 for p, s in zip(model.parameters(), slow):
                     s.add_(p.detach() - s, alpha=args.lookahead_alpha)
                     p.copy_(s)
+        if ema is not None:
+            with torch.no_grad():
+                for e, p in zip(ema, model.parameters()):
+                    e.mul_(args.ema_eval_beta).add_(p.detach().float(), alpha=1 - args.ema_eval_beta)
         if step % args.eval_every == 0 or step == 1:
             torch.cuda.synchronize()
             ev_now = torch.cuda.Event(enable_timing=True); ev_now.record(); torch.cuda.synchronize()
             model.eval()
             with torch.no_grad():
                 vl = float(np.mean([float(model(vx, vy).item()) for vx, vy in val_batches]))
+                if ema is not None:
+                    # swap in the bias-corrected EMA, eval, swap back (training state untouched)
+                    corr = 1.0 - args.ema_eval_beta ** step
+                    backup = [p.detach().clone() for p in model.parameters()]
+                    for e, p in zip(ema, model.parameters()):
+                        p.data.copy_((e / corr).to(p.dtype))
+                    vle = float(np.mean([float(model(vx, vy).item()) for vx, vy in val_batches]))
+                    for b, p in zip(backup, model.parameters()):
+                        p.data.copy_(b)
+                    log["val_ema"].append(vle)
             model.train()
             log["step"].append(step); log["val"].append(vl)
             log["wall_ms"].append(ev_start.elapsed_time(ev_now))
+            ema_str = f"  ema {log['val_ema'][-1]:.4f}" if ema is not None else ""
             print(f"  [{arm:14s} lr{lr:.3f}] step {step:4d}/{args.num_iterations}  "
-                  f"val {vl:.4f}  ({log['wall_ms'][-1]/1000:.1f}s)")
+                  f"val {vl:.4f}{ema_str}  ({log['wall_ms'][-1]/1000:.1f}s)")
     return log
 
 
@@ -800,7 +830,13 @@ def main():
     # the paired difference would make artificially tight). VAL is held FIXED across seeds
     # (common measuring stick). seed 0 -> offset 0 == the original single-seed behaviour.
     train_resume = ({"pq_idx": args.seed, "rg_idx": 0, "epoch": 1} if args.seed else None)
-    train_batches = materialise("train", args.num_iterations, resume_state_dict=train_resume)
+    if args.data_repeat > 1:
+        n_unique = -(-args.num_iterations // args.data_repeat)  # ceil
+        uniq = materialise("train", n_unique, resume_state_dict=train_resume)
+        train_batches = (uniq * args.data_repeat)[: args.num_iterations]
+        print(f"[data-repeat] {n_unique} unique batches x{args.data_repeat} epochs")
+    else:
+        train_batches = materialise("train", args.num_iterations, resume_state_dict=train_resume)
     val_batches = materialise("val", args.n_val_batches)
     print(f"depth {args.depth}, vocab {vocab}, {len(train_batches)} train + {len(val_batches)} val batches")
 
@@ -830,7 +866,8 @@ def main():
                    "ns_steps", "weight_decay", "momentum", "beta2",
                    "warmup_steps", "n_val_batches", "eval_every",
                    "soft_tau", "soft_q", "soft_mode", "snr_strength", "soft_no_renorm", "role_lr_mults",
-                   "anderson_window", "anderson_reg", "anderson_restart", "wwd_strength", "wwd_power", "wwd")
+                   "anderson_window", "anderson_reg", "anderson_restart", "wwd_strength", "wwd_power", "wwd",
+                   "ema_eval_beta", "data_repeat")
             if [pc.get(k, cfg[k]) for k in sig] == [cfg[k] for k in sig]:
                 done = prev.get("_done", {})
                 if done:
@@ -854,6 +891,8 @@ def main():
             del model; torch.cuda.empty_cache()
             done[key] = {"arm": arm, "lr": lr, "best_val": min(log["val"]), "final_val": log["val"][-1],
                          "total_wall_s": log["wall_ms"][-1] / 1000, "curve": log}
+            if log.get("val_ema"):
+                done[key]["best_val_ema"] = min(log["val_ema"])
             _atomic_write(out_path, {"config": cfg, "_done": done})  # checkpoint after each sub-run
 
     # finalize: best lr per arm from the completed sub-runs
