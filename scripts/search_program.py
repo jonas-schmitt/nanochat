@@ -233,17 +233,11 @@ def main():
     def val_of(g):  return objs_of(g)[0]
 
     rng = np.random.default_rng(args.seed)
-    # Seed the population with the known frontier so the search refines rather than rediscovers:
-    # knee0 (searched temporal champion, lean polar), the confirmed WWD point (p=0.5, rc100), and
-    # muon+EMA (the free-lever baseline the fairness rule references).
-    from gns.temporal_grammar import TemporalGenome as _TG, LookaheadLevel as _LL
-    knee0_g = pg.ProgramGenome(temporal=_TG(momentum_betas=(0.95, 0.98), momentum_weights=(0.5069, 0.9978),
-                                            nesterov=True, extrap_coeff=0.25,
-                                            lookahead_levels=(_LL(10, 0.5), _LL(10, 0.7))))
-    wwd_g = pg.ProgramGenome(temporal=_TG(), wwd_power=0.5, recompute_every=100, wd_scale=0.5)
-    ema_g = pg.ProgramGenome(temporal=_TG(), eval_ema_beta=0.999)
-    seeds = [muon_g, look_g, cheaper_g, knee0_g, wwd_g, ema_g]
-    pop = seeds + [pg.random_program(rng) for _ in range(max(0, args.pop - len(seeds)))]
+    # Seed ONLY with the standard solvers (owner decision 2026-07-03): knee0/wwd/ema are OUR
+    # discoveries and belong in the REFERENCE table (must-beat bar), not the starting population —
+    # a search that starts at the known frontier proves nothing about discovery. If the search
+    # independently rediscovers knee0-like temporal structure, that is free replication evidence.
+    pop = [muon_g, look_g, cheaper_g] + [pg.random_program(rng) for _ in range(max(0, args.pop - 3))]
 
     print(f"=== PROGRAM grammar search (d{args.depth}, {args.steps} steps, lr {args.lr}, "
           f"pop {args.pop}, gens {args.gens}) — NSGA-II on (val, polar-cost) ===", flush=True)
