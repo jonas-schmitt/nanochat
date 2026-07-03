@@ -72,6 +72,12 @@ NorMuon variance reduction: per-neuron/column adaptive learning rate that normal
 update scales after orthogonalization (Muon's output has non-uniform scales across neurons).
 https://arxiv.org/pdf/2510.05491
 
+Two more (very) slight and optional improvements:
+1) MuonEq row equilibration: rescale each row to the mean row norm so the spectrum
+entering orthogonalization is better conditioned (https://arxiv.org/abs/2603.28254)
+2) Muon+ renormalization: snap the Frobenius norm to sqrt(min(m, n)), the norm of an exactly
+semi-orthogonal matrix, correcting for under-convergence of the polar iteration (https://arxiv.org/abs/2602.21545)
+
 Some of the changes in nanochat implementation:
 - Uses a simpler, more general approach to parameter grouping and stacking
 - Uses a single fused kernel for the momentum -> polar_express -> variance_reduction -> update step
@@ -140,8 +146,22 @@ def muon_step_fused(
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
-    # Polar express orthogonalization (U -> O)
-    g = polar_express_orth(g, ns_steps)
+    # MuonEq row equilibration: rescale each row to the mean row norm so the spectrum
+    # entering orthogonalization is better conditioned (upstream 4e014d3). Cast first so the
+    # equilibrated tensor feeds the shared polar map unchanged.
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    target = X.float().norm(dim=(-2, -1), keepdim=True) / (X.size(-2) ** 0.5)
+    row_norm = X.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    X = X * (target / row_norm).to(X.dtype)
+
+    # Polar express orthogonalization (U -> O); shared map — single source of truth with the
+    # GNS harness arms (merge resolution: upstream inlined this identical loop; we keep the helper)
+    g = polar_express_orth(X, ns_steps)
+
+    # Muon+ renormalization: snap Frobenius norm to sqrt(min(m, n))
+    target_norm = min(g.size(-2), g.size(-1)) ** 0.5
+    current_norm = g.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    g = g * (target_norm / current_norm).to(g.dtype)
 
     # Variance reduction
     beta2 = beta2_t.to(g.dtype)
