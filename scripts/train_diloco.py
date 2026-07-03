@@ -119,6 +119,14 @@ def parse_args():
     p.add_argument("--outer-whiten-guard", action="store_true",
                    help="stability guard for the whitened outer step (fallback to raw delta on "
                         "non-finite or cosine<0.1 directions); the pre-registered blowup fix")
+    # TIER-1 REPLAY (TODO.md "RE-ENTRY SEARCH ARCHITECTURE"): record the RAW (pre-wire) per-round
+    # per-worker delta streams + θ0, so replay_policy.py can evaluate wire/outer gene variants
+    # without retraining. Record with an fp32 WIRE genome (the natural anchor: candidate policies
+    # then apply their own compression to raw deltas).
+    p.add_argument("--record-deltas", type=str, default="",
+                   help="path to save {theta0, per-round per-worker raw deltas, config} for replay")
+    p.add_argument("--record-dtype", type=str, default="float32", choices=("float32", "bfloat16"),
+                   help="storage dtype for recorded deltas (fp32 = bit-faithful replay gate)")
     return p.parse_args()
 
 
@@ -231,6 +239,10 @@ def run_policy(genome, args, model, train_shards, val_batches, device):
 
     h = genome.h
     n_rounds = math.ceil(args.num_iterations / h)
+    rec_path = getattr(args, "record_deltas", "")
+    rec_dtype = getattr(torch, getattr(args, "record_dtype", "float32"))
+    rec_rounds: list[list[list[torch.Tensor]]] = []   # [round][worker][param] raw deltas (CPU)
+    rec_theta0 = [t.detach().cpu().clone() for t in theta] if rec_path else None
     delta_stats_log: list[tuple] = []
     log = {"step": [], "val": [], "wall_ms": [], "comm_bits": []}
     n_params_synced = sum(p.numel() for p in all_params)
@@ -290,6 +302,11 @@ def run_policy(genome, args, model, train_shards, val_batches, device):
                     w.madam.step()
                 w.steps_done += 1
             with torch.no_grad():                                          # Δ_m through the wire
+                if rec_path:
+                    if w.idx == 0:
+                        rec_rounds.append([])
+                    rec_rounds[r].append([(p.detach().float() - t).to(rec_dtype).cpu()
+                                          for p, t in zip(all_params, theta)])
                 for i, (p, t) in enumerate(zip(all_params, theta)):
                     raw = p.detach().float() - t
                     if w.idx == 0 and id(p) in mp_ids and len(delta_stats_log) < 400:
@@ -329,6 +346,15 @@ def run_policy(genome, args, model, train_shards, val_batches, device):
             evaluate(step_now)
             while next_eval <= step_now:
                 next_eval += args.eval_every
+    if rec_path:
+        torch.save({"theta0": rec_theta0, "rounds": rec_rounds,
+                    "steps_per_round": [min(h, args.num_iterations - r * h) for r in range(n_rounds)],
+                    "genome": genome_to_dict(genome), "log": log,
+                    "config": {k: v for k, v in vars(args).items() if not k.startswith("_")}},
+                   rec_path)
+        gb = sum(d.numel() * d.element_size() for ws in rec_rounds for w_ in ws for d in w_) / 1e9
+        print(f"  recorded {len(rec_rounds)} rounds x {args.workers} workers raw deltas "
+              f"({gb:.2f} GB) -> {rec_path}")
     if delta_stats_log:
         arr = np.array(delta_stats_log)
         log["delta_stats"] = {"rho_clean": float(arr[:, 0].mean()), "rho_hit": float(arr[:, 1].mean()),
