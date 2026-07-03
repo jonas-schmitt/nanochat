@@ -75,8 +75,14 @@ def main():
     for lab, g in cands.items():
         print(f"  {lab:14s} cost {g.extra_matmuls():+.3f}  {pg.canonical(g)}", flush=True)
 
-    # vals[label][depth] = list over seeds
+    # EMA-fairness (2026-07-02): every arm is judged at its BEST eval protocol (raw vs EMA-0.99 vs
+    # EMA-0.999) — train_genome prices all of them from one trained run. Judging candidates at their
+    # ema gene against RAW references inflates the margin by the free Polyak-averaging win (~0.15 at
+    # short horizon) and would make a PASS meaningless.
+    # vals[label][depth] = list over seeds (best-protocol); vals_own = at the genome's own ema gene
     vals: dict[str, dict[int, list[float]]] = {lab: {d: [] for d in depths} for lab in cands}
+    vals_own: dict[str, dict[int, list[float]]] = {lab: {d: [] for d in depths} for lab in cands}
+    proto_used: dict[str, dict[int, list[float]]] = {lab: {d: [] for d in depths} for lab in cands}
     for d in depths:
         for s in seeds:
             t0 = time.time()
@@ -85,29 +91,43 @@ def main():
             for lab, g in cands.items():
                 tg = time.time()
                 res = train_genome(ctx, g, args)   # dict since the ema-densification upgrade
-                v = res[g.eval_ema_beta] if isinstance(res, dict) else res
-                vals[lab][d].append(v)
-                print(f"  [d{d} s{s}] {lab:14s} val {v:.4f}  ({time.time()-tg:.0f}s)", flush=True)
+                if isinstance(res, dict):
+                    protos = {b: v for b, v in res.items() if isinstance(b, float)}
+                    b_best, v_best = min(protos.items(), key=lambda kv: kv[1])
+                    v_own = res[g.eval_ema_beta]
+                else:
+                    b_best, v_best, v_own = g.eval_ema_beta, res, res
+                vals[lab][d].append(v_best); vals_own[lab][d].append(v_own)
+                proto_used[lab][d].append(b_best)
+                print(f"  [d{d} s{s}] {lab:14s} val {v_best:.4f} (best-proto ema{b_best:g}; "
+                      f"own {v_own:.4f})  ({time.time()-tg:.0f}s)", flush=True)
             del ctx
             torch.cuda.empty_cache()
 
     mean = {lab: {d: float(np.mean(vs)) for d, vs in dd.items()} for lab, dd in vals.items()}
+    sem = {lab: {d: float(np.std(vs) / max(1, len(vs) - 1) ** 0.5) for d, vs in dd.items()}
+           for lab, dd in vals.items()}
     dmin, dmax = min(depths), max(depths)
+    refs = [r for r in ("muon", "cheaper_muon", "lookahead") if r in cands]
+    # the must-beat bar at each depth: the BEST reference, each at ITS best eval protocol
+    bestref = {d: min(mean[r][d] for r in refs) for d in depths}
     la = "lookahead"
     report = {}
     for lab in cands:
-        # margin over lookahead (positive = candidate beats the floor) at each depth
-        margin = {d: mean[la][d] - mean[lab][d] for d in depths}
-        slope = margin[dmax] - margin[dmin]
-        passes = (lab not in ("muon", "cheaper_muon", "lookahead")
-                  and margin[dmin] > 0.0 and slope >= -0.005)
+        margin_la = {d: mean[la][d] - mean[lab][d] for d in depths}
+        margin_ref = {d: bestref[d] - mean[lab][d] for d in depths}
+        slope = margin_ref[dmax] - margin_ref[dmin]
+        passes = (lab not in refs and margin_ref[dmin] > 0.0 and slope >= -0.005)
         report[lab] = {
             "canonical": pg.canonical(cands[lab]),
             "cost": cands[lab].extra_matmuls(),
             "val_mean": mean[lab],
-            "margin_over_lookahead": margin,
+            "val_sem": sem[lab],
+            "eval_protocols_used": proto_used[lab],
+            "margin_over_lookahead": margin_la,
+            "margin_over_bestref": margin_ref,
             "trend_slope_d{}_to_d{}".format(dmin, dmax): slope,
-            "verdict": "PASS" if passes else ("ref" if lab in ("muon", "cheaper_muon", "lookahead") else "FAIL"),
+            "verdict": "PASS" if passes else ("ref" if lab in refs else "FAIL"),
         }
 
     out = {
@@ -115,18 +135,20 @@ def main():
                    "gns_sha": _git_sha("/home/jonas/git/gns"),
                    "nanochat_sha": _git_sha("/home/jonas/git/nanochat")},
         "val_seedmean": mean,
+        "val_seeds_bestproto": {lab: dd for lab, dd in vals.items()},
+        "val_seeds_owngene": {lab: dd for lab, dd in vals_own.items()},
         "candidates": report,
     }
     json.dump(out, open(args.out, "w"), indent=1)
 
-    print(f"\n=== TREND GATE RESULT ===")
+    print(f"\n=== TREND GATE RESULT (all arms at their BEST eval protocol) ===")
     print(f"  {'label':14s} {'d'+str(dmin):>8s} {'d'+str(dmax):>8s}  "
-          f"{'margin@d'+str(dmin):>11s} {'margin@d'+str(dmax):>11s} {'slope':>8s}  verdict")
+          f"{'vs-ref@d'+str(dmin):>11s} {'vs-ref@d'+str(dmax):>11s} {'slope':>8s}  verdict")
     for lab, r in report.items():
-        m = r["margin_over_lookahead"]
+        m = r["margin_over_bestref"]
         print(f"  {lab:14s} {mean[lab][dmin]:8.4f} {mean[lab][dmax]:8.4f}  "
               f"{m[dmin]:+11.4f} {m[dmax]:+11.4f} {r['trend_slope_d%d_to_d%d'%(dmin,dmax)]:+8.4f}  {r['verdict']}")
-    print(f"\n  PASS = beats Lookahead at d{dmin} AND margin holds/grows to d{dmax}.")
+    print(f"\n  PASS = beats the BEST EMA-matched reference at d{dmin} AND margin holds/grows to d{dmax}.")
 
 
 if __name__ == "__main__":

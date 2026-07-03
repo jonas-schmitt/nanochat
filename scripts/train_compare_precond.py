@@ -176,6 +176,12 @@ def parse_args():
     # N times (multi-epoch regime). WWD's mechanism predicts its edge GROWS with repetition.
     p.add_argument("--data-repeat", type=int, default=1,
                    help="1=off; N>1: train on ceil(num_iterations/N) unique batches cycled N times")
+    # MoE MLP (A1 WWD×MoE probe): E identical experts, top-1 routing = iso-active-FLOPs vs dense;
+    # per-expert tokens/step ~ 1/E is the data-starvation axis. Router -> AdamW (below MIN_MUON_DIM);
+    # every expert c_fc/c_proj -> Muon/WWD matrix path with per-expert factors.
+    p.add_argument("--moe-experts", type=int, default=1, help="1=dense; E>1: Switch-style MoE MLP")
+    p.add_argument("--moe-top-k", type=int, default=1)
+    p.add_argument("--moe-aux-coeff", type=float, default=0.01)
     p.add_argument("--arms", type=str, default="muon,shampoo,ortho_shampoo,layer_adaptive,sgd")
     p.add_argument("--polar-coeffs", type=str, default="",
                    help="③ searched_polar arm: ';'-separated 'a,b,c' Gram-poly triples")
@@ -214,7 +220,10 @@ def build_model(args, vocab_size, device, seed):
     num_heads = model_dim // args.head_dim
     cfg = GPTConfig(sequence_len=args.max_seq_len, vocab_size=vocab_size,
                     n_layer=args.depth, n_head=num_heads, n_kv_head=num_heads,
-                    n_embd=model_dim, window_pattern="L")
+                    n_embd=model_dim, window_pattern="L",
+                    n_experts=getattr(args, "moe_experts", 1),
+                    moe_top_k=getattr(args, "moe_top_k", 1),
+                    moe_aux_coeff=getattr(args, "moe_aux_coeff", 0.01))
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     with torch.device("meta"):
@@ -784,8 +793,16 @@ def run_arm(arm, lr, args, model, train_batches, val_batches, device):
             log["step"].append(step); log["val"].append(vl)
             log["wall_ms"].append(ev_start.elapsed_time(ev_now))
             ema_str = f"  ema {log['val_ema'][-1]:.4f}" if ema is not None else ""
+            # MoE router-collapse monitor: min/max per-expert token fraction across layers
+            moe_str = ""
+            _m = getattr(model, "_orig_mod", model)
+            loads = [blk.mlp.last_load for blk in _m.transformer.h
+                     if getattr(blk.mlp, "last_load", None) is not None]
+            if loads:
+                lo = min(float(l.min()) for l in loads); hi = max(float(l.max()) for l in loads)
+                moe_str = f"  load[{lo:.2f},{hi:.2f}]"
             print(f"  [{arm:14s} lr{lr:.3f}] step {step:4d}/{args.num_iterations}  "
-                  f"val {vl:.4f}{ema_str}  ({log['wall_ms'][-1]/1000:.1f}s)")
+                  f"val {vl:.4f}{ema_str}{moe_str}  ({log['wall_ms'][-1]/1000:.1f}s)")
     return log
 
 

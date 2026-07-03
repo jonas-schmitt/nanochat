@@ -37,6 +37,12 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # MoE MLP (A1 WWD×MoE probe): n_experts=1 keeps the dense MLP (default path untouched).
+    # Each expert is an identical 4x MLP, so top-1 routing is iso-active-FLOPs with dense and
+    # per-expert tokens/step scale as ~1/E — the data-starvation axis the probe varies.
+    n_experts: int = 1
+    moe_top_k: int = 1
+    moe_aux_coeff: float = 0.01  # Switch-style load-balance loss weight (train loss only)
 
 
 def norm(x):
@@ -142,11 +148,52 @@ class MLP(nn.Module):
         return x
 
 
+class MoEMLP(nn.Module):
+    """Minimal Switch-style MoE MLP (A1 WWD×MoE probe). E identical 4x-expansion experts,
+    top-k softmax routing, dropless dispatch (gather per expert), Switch load-balance aux.
+    Design constraints that matter here:
+      - experts are E separate `Linear`s so every expert c_fc/c_proj is a 2D matrix under
+        transformer.h -> they enter the Muon/WWD matrix path with PER-EXPERT whitening factors
+        (the mechanism A1 tests); the router (n_embd x E, min dim E < MIN_MUON_DIM) falls to AdamW.
+      - router runs in fp32; top-1 argmax routing is deterministic under GNS_DETERMINISTIC.
+      - aux_loss is stashed per forward; GPT.forward adds it to the TRAIN loss only, so VAL
+        stays pure CE and comparable across expert counts."""
+    def __init__(self, config):
+        super().__init__()
+        self.n_experts = config.n_experts
+        self.top_k = config.moe_top_k
+        self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.experts = nn.ModuleList(MLP(config) for _ in range(config.n_experts))
+        self.aux_loss = None
+        self.last_load = None  # fraction of tokens per expert (router-collapse monitor)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        xf = x.reshape(-1, C)
+        probs = self.router(xf.float()).softmax(-1)                # (N, E), fp32
+        topv, topi = probs.topk(self.top_k, dim=-1)                # (N, k)
+        topv = topv / topv.sum(-1, keepdim=True)                   # renormalized gate weights
+        out = torch.zeros_like(xf)
+        for e, expert in enumerate(self.experts):
+            hit = topi == e                                        # (N, k)
+            rows = hit.any(-1).nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            w = (topv * hit).sum(-1)[rows].to(x.dtype).unsqueeze(-1)
+            out.index_add_(0, rows, w * expert(xf[rows]))
+        # Switch aux: E * sum_e f_e * P_e (f = realized top-1 fraction, P = mean router prob)
+        with torch.no_grad():
+            f = torch.bincount(topi[:, 0], minlength=self.n_experts).to(probs.dtype) / topi.size(0)
+        self.aux_loss = self.n_experts * (f * probs.mean(0)).sum()
+        self.last_load = f
+        return out.view(B, T, C)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MoEMLP(config) if config.n_experts > 1 else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -229,8 +276,13 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            # dense MLP or every MoE expert (same per-matrix init either way)
+            for m in (block.mlp.experts if isinstance(block.mlp, MoEMLP) else [block.mlp]):
+                torch.nn.init.uniform_(m.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+                torch.nn.init.zeros_(m.c_proj.weight)
+            if isinstance(block.mlp, MoEMLP):
+                # small nonzero init: near-uniform routing at start, symmetry broken deterministically
+                torch.nn.init.uniform_(block.mlp.router.weight, -0.02, 0.02)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -501,6 +553,11 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # MoE load-balance aux joins the TRAIN loss only (self.training); eval stays pure CE
+            # so val is comparable across expert counts.
+            if self.training and self.config.n_experts > 1 and loss_reduction == 'mean':
+                aux = sum(blk.mlp.aux_loss for blk in self.transformer.h)
+                loss = loss + self.config.moe_aux_coeff * aux
             return loss
         else:
             # inference: just return the logits directly

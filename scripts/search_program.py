@@ -321,15 +321,29 @@ def main():
                        "is_cheaper_muon": k == pg.canonical(cheaper_g),
                        "is_lookahead": k == pg.canonical(look_g)} for k in seen),
                      key=lambda r: r["val"])
+    def _bestproto_v(g):
+        """Best val over the eval-EMA protocol siblings of g (all priced by one trained run)."""
+        from dataclasses import replace as _dcr
+        sibs = [seen[pg.canonical(_dcr(g, eval_ema_beta=b))][0]
+                for b in pg.EVAL_EMA_MENU if pg.canonical(_dcr(g, eval_ema_beta=b)) in seen]
+        return min(sibs) if sibs else seen[pg.canonical(g)][0]
+
     summary = {
         "config": {**vars(args), "polar_menu": [v.name for v in POLAR_MENU],
                    "gns_sha": _git_sha("/home/jonas/git/gns"),
                    "nanochat_sha": _git_sha("/home/jonas/git/nanochat"),
                    "n_evaluated": len(seen)},
         "muon_val": muon_v, "cheaper_muon_val": cheap_v, "lookahead_val": look_v,
+        # EMA-matched references (best over eval protocols, via L3-cached siblings): candidates carry
+        # an eval-EMA gene, so raw-reference margins overstate the win by the free Polyak-averaging
+        # gain. THESE are the honest bars.
+        "muon_val_bestproto": _bestproto_v(muon_g), "cheaper_muon_val_bestproto": _bestproto_v(cheaper_g),
+        "lookahead_val_bestproto": _bestproto_v(look_g),
+        "best_beats_muon_bestproto_by": _bestproto_v(muon_g) - best_v,
+        "best_beats_lookahead_bestproto_by": _bestproto_v(look_g) - best_v,
         "best_val": best_v, "best_genome": best_key,
-        "best_beats_muon_by": muon_v - best_v,
-        "best_beats_lookahead_by": look_v - best_v,        # <-- the honest headline
+        "best_beats_muon_by": muon_v - best_v,             # raw-reference margin (inflated; kept for continuity)
+        "best_beats_lookahead_by": look_v - best_v,
         "cheaper_muon_beats_muon_by": muon_v - cheap_v,    # the cost-only floor
         "temporal_residual_over_cheaper": cheap_v - best_v,  # what the temporal structure adds
         "pareto_front": [{"genome": k, "val": seen[k][0], "cost": seen[k][1]} for k in pareto],
@@ -342,6 +356,8 @@ def main():
     print(f"\n=== RESULT ===")
     print(f"  muon {muon_v:.4f} | cheaper-muon(polar4) {cheap_v:.4f} | lookahead {look_v:.4f} | best {best_v:.4f}")
     print(f"  best beats LOOKAHEAD by {look_v-best_v:+.4f}  (vs muon {muon_v-best_v:+.4f})")
+    print(f"  EMA-MATCHED (honest) margins: vs muon@bestproto {_bestproto_v(muon_g)-best_v:+.4f}, "
+          f"vs lookahead@bestproto {_bestproto_v(look_g)-best_v:+.4f}")
     print(f"  of which cheaper-muon floor {muon_v-cheap_v:+.4f}, temporal residual {cheap_v-best_v:+.4f}")
     print(f"  Pareto knees (-> Stage-2): {pareto}")
     print(f"  best genome: {best_key}")
