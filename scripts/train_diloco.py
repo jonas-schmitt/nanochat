@@ -347,11 +347,17 @@ def run_policy(genome, args, model, train_shards, val_batches, device):
             while next_eval <= step_now:
                 next_eval += args.eval_every
     if rec_path:
+        # ATOMIC save (temp + rename): the recording is large (~45 GB) and slow to write; if the job
+        # is killed mid-save, only the .tmp is left and the real path stays ABSENT, so the resumable
+        # orchestrator re-runs the anchor cleanly instead of skipping a truncated/corrupt file.
+        import os
+        tmp = rec_path + ".tmp"
         torch.save({"theta0": rec_theta0, "rounds": rec_rounds,
                     "steps_per_round": [min(h, args.num_iterations - r * h) for r in range(n_rounds)],
                     "genome": genome_to_dict(genome), "log": log,
                     "config": {k: v for k, v in vars(args).items() if not k.startswith("_")}},
-                   rec_path)
+                   tmp)
+        os.replace(tmp, rec_path)
         gb = sum(d.numel() * d.element_size() for ws in rec_rounds for w_ in ws for d in w_) / 1e9
         print(f"  recorded {len(rec_rounds)} rounds x {args.workers} workers raw deltas "
               f"({gb:.2f} GB) -> {rec_path}")
