@@ -35,6 +35,7 @@ from gns.policy_grammar import (  # noqa: E402
     OUTER_LR_MENU,
     OUTER_TRANSFORM_MENU,
     canonical,
+    from_dict as genome_from_dict,
     to_dict as genome_to_dict,
 )
 from gns.search import _rank_and_crowd, fast_nondominated_sort  # noqa: E402
@@ -54,6 +55,8 @@ def parse_args():
     p.add_argument("--include-geometry", action="store_true",
                    help="also search outer_transform (off-policy DOUBTFUL — rank-gate first)")
     p.add_argument("--out", type=str, default="/home/jonas/git/gns/results/search_policy_tier1.json")
+    p.add_argument("--resume", action="store_true",
+                   help="reload the <out>.ckpt.json search state (seen cache + RNG + generation) if present")
     return p.parse_args()
 
 
@@ -93,6 +96,28 @@ def _mutate(rng, g, anchor, include_geometry):
         return dc_replace(g, outer=TemporalGenome(momentum_betas=(beta,),
                                                   nesterov=bool(rng.random() < 0.5)))
     return dc_replace(g, outer_transform=str(rng.choice(OUTER_TRANSFORM_MENU)))
+
+
+def _atomic_json(path, obj):
+    """Write JSON atomically (temp + rename) so a kill mid-write never leaves a half-file."""
+    import os
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def _save_ckpt(path, seen, genomes, rng, gen_done, population):
+    """Resumable search state: the seen genome->objectives cache (each entry = one replay eval),
+    the genome dicts, the RNG bit-generator state, the last completed generation, and the current
+    population (by canonical key). Atomic — safe to kill at any point."""
+    _atomic_json(path, {
+        "seen": {k: list(v) for k, v in seen.items()},
+        "genomes": {k: genome_to_dict(g) for k, g in genomes.items()},
+        "rng_state": rng.bit_generator.state,
+        "gen_done": gen_done,
+        "population": [canonical(g) for g in population],
+    })
 
 
 def _crossover(rng, a, b):
@@ -148,13 +173,27 @@ def main():
     # seeds: the fp32 anchor + the hand-picked MuLoCo-2bit wire (the must-match reference) + randoms
     ref2bit = dc_replace(anchor, delta_bits=2, error_feedback=True, ef_beta=0.9,
                          stochastic_rounding=False)
-    pop = [anchor, ref2bit] + [_sample(rng, anchor, cli.include_geometry)
-                               for _ in range(max(0, cli.pop - 2))]
-    print(f"=== TIER-1 policy search (pop {cli.pop}, gens {cli.gens}) on (replay-val, comm-bits) ===")
-    for g in pop:
-        objs_of(g)
-    population = list(pop)
-    for gen in range(1, cli.gens + 1):
+    ckpt_path = cli.out + ".ckpt.json"
+    start_gen = 1
+    import os
+    if cli.resume and os.path.exists(ckpt_path):
+        ck = json.load(open(ckpt_path))
+        seen.update({k: tuple(v) for k, v in ck["seen"].items()})
+        genomes.update({k: genome_from_dict(v) for k, v in ck["genomes"].items()})
+        rng.bit_generator.state = ck["rng_state"]
+        start_gen = ck["gen_done"] + 1
+        population = [genomes[k] for k in ck["population"]]
+        print(f"=== RESUMED tier-1 search from {ckpt_path}: {len(seen)} evals cached, "
+              f"resuming at gen {start_gen}/{cli.gens} ===", flush=True)
+    else:
+        pop = [anchor, ref2bit] + [_sample(rng, anchor, cli.include_geometry)
+                                   for _ in range(max(0, cli.pop - 2))]
+        print(f"=== TIER-1 policy search (pop {cli.pop}, gens {cli.gens}) on (replay-val, comm-bits) ===")
+        for g in pop:
+            objs_of(g)
+        population = list(pop)
+        _save_ckpt(ckpt_path, seen, genomes, rng, 0, population)
+    for gen in range(start_gen, cli.gens + 1):
         objs = [objs_of(g) for g in population]
         rank, crowd = _rank_and_crowd(objs)
         order = sorted(range(len(population)), key=lambda i: (rank[i], -crowd[i]))
@@ -176,6 +215,7 @@ def main():
         m_rank, m_crowd = _rank_and_crowd(m_objs)
         m_order = sorted(range(len(members)), key=lambda i: (m_rank[i], -m_crowd[i]))
         population = [members[i] for i in m_order[: cli.pop]]
+        _save_ckpt(ckpt_path, seen, genomes, rng, gen, population)
 
     finite = {k: v for k, v in seen.items() if np.isfinite(v[0])}
     keys = list(finite)
