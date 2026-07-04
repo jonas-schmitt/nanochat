@@ -1,22 +1,27 @@
 """Final verdict for the fused early-kill gate (TODO "FUSED EARLY-KILL GATE").
 
 Combines the replay-rank-gate trust verdict with the tier-2-validated Pareto front to emit
-GO-strong / GO-floor / KILL, per the pre-registered criteria in
-notes/fused-earlykill-preregistration.md.
+GO-strong / GO-floor / KILL, per notes/fused-earlykill-preregistration.md.
 
   GO-strong: replay trusted on >= the precision axis AND a tier-2 (REAL) front point dominates or
-             matches the tuned MuLoCo incumbent on the val x bits frontier (beyond the noise floor).
-  GO-floor : replay trusted + a non-trivial frontier that rediscovers sensible points, even if none
-             strictly beats the incumbent.
+             matches the tuned MuLoCo incumbent FRONTIER on the val x comm-bits plane.
+  GO-floor : replay trusted + a non-trivial frontier (>=3 pts) even if none beats the incumbents.
   KILL     : replay untrusted even for precision, or a degenerate frontier.
 
-Inputs: the rank-gate JSON, the tier-1 search JSON (for the front + its replay vals), and the tier-2
-REAL result JSONs (train_diloco format) for the front knees that were re-run.
+Objective is comm_bits_per_param_step (analytic; fp32/H30 = 1.0667, 2-bit/H30 = 0.0667) — NOT the raw
+delta_bits. Incumbents are the tuned hand-picked points; both are passed as result JSONs and their
+(best_val, bits) are computed from their own genomes, so the bar can never be mis-specified by hand.
 """
 import argparse
 import glob
 import json
 import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, "/home/jonas/git/gns/src")
+from gns.policy_grammar import from_dict  # noqa: E402
 
 
 def _load(path):
@@ -26,14 +31,26 @@ def _load(path):
         return None
 
 
+def _val_bits(path):
+    """(best_val, comm_bits_per_param_step) from a train_diloco result JSON, or None."""
+    d = _load(path)
+    if not d or "best_val" not in d:
+        return None
+    try:
+        bits = from_dict(d["config"]["genome"]).comm_bits_per_param_step()
+    except Exception:
+        return None
+    return float(d["best_val"]), float(bits)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--rank-gate", required=True)
     p.add_argument("--search", required=True)
-    p.add_argument("--tier2-glob", required=True, help="glob of tier-2 REAL result JSONs")
-    p.add_argument("--incumbent-val", type=float, default=3.8210, help="tuned MuLoCo best val (olr2)")
-    p.add_argument("--incumbent-bits", type=float, default=32.0, help="incumbent bits/param/step")
-    p.add_argument("--noise", type=float, default=0.003, help="d6/1500 val noise floor")
+    p.add_argument("--tier2-glob", required=True)
+    p.add_argument("--incumbents", required=True,
+                   help="comma-separated tuned-incumbent result JSONs (val,bits read from each)")
+    p.add_argument("--noise", type=float, default=0.003, help="d6/1500 val noise floor (val-tie band)")
     p.add_argument("--out", default="/home/jonas/git/gns/results/fused_earlykill_verdict.json")
     a = p.parse_args()
 
@@ -44,51 +61,76 @@ def main():
     search = _load(a.search) or {}
     front = search.get("front", [])
 
-    # tier-2: REAL runs of front knees. Match by canonical genome; take (real best_val, bits).
+    incumbents = []
+    for path in a.incumbents.split(","):
+        vb = _val_bits(path.strip())
+        if vb:
+            incumbents.append({"file": os.path.basename(path.strip()), "val": vb[0], "bits": vb[1]})
+    if not incumbents:
+        print("ERROR: no readable incumbents — cannot judge dominance", flush=True)
+        sys.exit(2)
+
+    # tier-2: REAL runs of front knees; bits computed from each run's OWN genome (robust, no matching)
     tier2 = []
     for path in sorted(glob.glob(a.tier2_glob)):
-        d = _load(path)
-        if not d:
-            continue
-        g = d.get("config", {}).get("genome_canonical") or d.get("config", {}).get("genome")
-        bits = None
-        # bits/param/step: prefer the analytic field if the run recorded it, else derive from front
-        for f in front:
-            if f.get("genome") == g:
-                bits = f.get("bits_per_param_step")
-        tier2.append({"canonical": g, "real_best": float(d["best_val"]), "bits": bits,
-                      "file": os.path.basename(path)})
+        vb = _val_bits(path)
+        if vb:
+            tier2.append({"file": os.path.basename(path), "val": vb[0], "bits": vb[1]})
 
-    # dominance: real val <= incumbent+noise AND bits <= incumbent bits (a Pareto win or match)
-    dominators = [t for t in tier2 if t["bits"] is not None
-                  and t["real_best"] <= a.incumbent_val + a.noise
-                  and t["bits"] <= a.incumbent_bits]
+    # P (searched) "dominates or matches" incumbent I iff P.val <= I.val + noise AND P.bits <= I.bits,
+    # with a strict improvement on >=1 axis (val by more than noise, or fewer bits). Checked against
+    # EACH incumbent; a single win over either the fp32 or the 2-bit point advances the hand frontier.
+    def wins(P, I):
+        no_worse = P["val"] <= I["val"] + a.noise and P["bits"] <= I["bits"] + 1e-9
+        strict = P["val"] < I["val"] - a.noise or P["bits"] < I["bits"] - 1e-9
+        return no_worse and strict
+
+    # A pure tie (same val AND same bits) is REDISCOVERY of an incumbent, not a win -> GO-floor, not
+    # GO-strong. Only genuine Pareto improvement (`wins`) counts as strong.
+    def ties(P, I):
+        return (abs(P["val"] - I["val"]) <= a.noise and abs(P["bits"] - I["bits"]) <= 1e-9)
+
+    winners = []
+    for P in tier2:
+        hit = [I for I in incumbents if wins(P, I)]
+        tie = [I for I in incumbents if ties(P, I) and I["file"] not in [x["file"] for x in hit]]
+        P["dominates"] = [I["file"] for I in hit]
+        P["rediscovers"] = [I["file"] for I in tie]
+        if hit:
+            winners.append(P)
+
     nontrivial_front = len(front) >= 3
+    strong = any(P["dominates"] for P in tier2)   # only genuine Pareto improvement
 
     if not replay_trusted:
-        verdict = "KILL"; why = "replay not trusted even for precision genes (cheap search is invalid)"
-    elif dominators:
-        verdict = "GO-strong"; why = f"{len(dominators)} tier-2 point(s) dominate/match tuned MuLoCo"
+        verdict, why = "KILL", "replay not trusted even for precision genes (cheap search is invalid)"
+    elif strong:
+        verdict, why = "GO-strong", "a tier-2 point dominates/matches the tuned incumbent frontier"
     elif nontrivial_front:
-        verdict = "GO-floor"; why = "replay trusted + non-trivial frontier (methods-paper floor)"
+        verdict, why = "GO-floor", "replay trusted + non-trivial frontier (methods-paper floor)"
     else:
-        verdict = "KILL"; why = "degenerate frontier"
+        verdict, why = "KILL", "degenerate frontier"
 
     print("=== FUSED EARLY-KILL VERDICT ===")
     print(f"  replay trust: precision={trust.get('precision')} geometry={trust.get('geometry')}")
+    print("  incumbent frontier:")
+    for I in incumbents:
+        print(f"    val {I['val']:.4f}  bits/p/s {I['bits']:.4f}  {I['file']}")
     print(f"  tier-1 front size: {len(front)}   tier-2 validated: {len(tier2)}")
-    for t in tier2:
-        mark = "  <-- dominates/matches" if t in dominators else ""
-        b = f"{t['bits']:.4f}" if t["bits"] is not None else "?"
-        print(f"    real {t['real_best']:.4f}  bits/p/s {b}  {t['file']}{mark}")
-    print(f"  incumbent: val {a.incumbent_val:.4f}  bits {a.incumbent_bits:g}")
+    for P in tier2:
+        tag = ""
+        if P["dominates"]:
+            tag = "  <-- DOMINATES " + ",".join(P["dominates"])
+        elif P["rediscovers"]:
+            tag = "  (rediscovers " + ",".join(P["rediscovers"]) + " — floor, not a win)"
+        print(f"    val {P['val']:.4f}  bits/p/s {P['bits']:.4f}  {P['file']}{tag}")
     print(f"\n  => {verdict}  ({why})")
     print("  GO-* : re-plan the full fused paper.   KILL : run WWD λ-gate closure, then tct.")
 
     tmp = a.out + ".tmp"
     json.dump({"verdict": verdict, "why": why, "replay_trusted": replay_trusted,
-               "dominators": dominators, "tier2": tier2, "front_size": len(front)},
-              open(tmp, "w"), indent=1)
+               "incumbents": incumbents, "tier2": tier2, "winners": winners,
+               "front_size": len(front)}, open(tmp, "w"), indent=1)
     os.replace(tmp, a.out)
     print(f"wrote {a.out}")
 

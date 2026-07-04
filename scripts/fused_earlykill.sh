@@ -93,5 +93,5 @@ echo "=== STEP 6: final verdict"
 $RUN scripts/judge_fused_earlykill.py \
   --rank-gate $R/fused_rank_gate.json --search $R/fused_search_tier1.json \
   --tier2-glob "$R/fused_tier2_knee*.json" \
-  --incumbent-val 3.8210 --incumbent-bits 32
+  --incumbents "$R/phaseb_muloco_olr2.json,$R/probe_muloco_2bit_olr4.json"
 echo "FUSED EARLY-KILL GATE COMPLETE"
