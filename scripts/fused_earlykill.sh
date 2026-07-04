@@ -10,6 +10,11 @@ export PYTHONUNBUFFERED=1
 RUN="uv run --project /home/jonas/git/tct-models python"
 R=/home/jonas/git/gns/results
 A=$R/fused_anchor_d6M4H30.pt          # the recorded anchor
+# Tier-1 search size (replay ~minutes/genome at full-anchor scale, so this is the gate's dominant cost).
+# POP is NOT resumable-extensible (population size is baked into the checkpoint) — set it right here.
+# GENS IS extensible on --resume, so keep it moderate and extend later only if the front warrants it
+# AND the rank gate trusts the axis. TIER2_K = how many front knees to validate with real runs.
+POP="${POP:-30}"; GENS="${GENS:-8}"; TIER2_K="${TIER2_K:-3}"; export TIER2_K
 
 LOG=$R/fused_earlykill_$(date +%Y%m%d_%H%M%S).log
 exec > >(tee -a "$LOG") 2>&1
@@ -47,7 +52,10 @@ diloco $R/ref_4bit_hadamard_olr4.json --preset muloco --outer-lr 4 --delta-bits 
 diloco $R/ref_2bit_noEF_olr4.json   --preset muloco --outer-lr 4 --delta-bits 2 --error-feedback 0
 
 echo "=== STEP 3b: replay-vs-real RANK gate (reuse existing reals + the 3 new + the anchor)"
+# geometry refs (outer lr 2/4/6/8/12 + polar + whitened) + precision refs (2bit±EF, 8bit, 4bit-hadamard)
+# + the anchor itself (fp32 sgd@olr4). All reuse real runs already on disk except the 3 new precision ones.
 REFS="$R/fused_anchor_d6M4H30.json,$R/phaseb_muloco_olr2.json,$R/phaseb_muloco_olr6.json"
+REFS="$REFS,$R/probe_muloco_fp32.json,$R/phaseb_muloco_olr12.json"
 REFS="$REFS,$R/probe_outer_polar_olr4.json,$R/probe_outer_whitened_olr4.json"
 REFS="$REFS,$R/probe_muloco_2bit_olr4.json,$R/ref_8bit_olr4.json"
 REFS="$REFS,$R/ref_4bit_hadamard_olr4.json,$R/ref_2bit_noEF_olr4.json"
@@ -59,14 +67,18 @@ GEOM=$(python3 -c "import json; print('--include-geometry' if json.load(open('$R
 echo "  geometry flag for tier-1 search: '${GEOM:-<precision-only>}'"
 
 echo "=== STEP 4: tier-1 replay search (resumable)"
-$RUN scripts/search_policy.py --recording "$A" --pop 20 --gens 6 --resume $GEOM \
+$RUN scripts/search_policy.py --recording "$A" --pop $POP --gens $GENS --resume $GEOM \
   --out $R/fused_search_tier1.json || echo "  (search interrupted — re-run to resume)"
 
 echo "=== STEP 5: tier-2 validation of the top-3 front knees (real runs)"
 python3 - "$R/fused_search_tier1.json" > /tmp/fused_front_genomes.txt <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-for i, f in enumerate(d.get("front", [])[:3]):
+import os
+# validate the BEST-QUALITY front knees (lowest replay-val) — the dominance candidates vs the
+# incumbent, i.e. the points that could match MuLoCo's val at fewer bits.
+front = sorted(d.get("front", []), key=lambda f: f["val"])
+for i, f in enumerate(front[: int(os.environ.get("TIER2_K", "5"))]):
     print(f"{i}\t{json.dumps(f['genome_dict'])}")
 PY
 while IFS=$'\t' read -r i gj; do

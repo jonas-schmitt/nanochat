@@ -60,8 +60,12 @@ def parse_args():
     return p.parse_args()
 
 
+# Gene families, split so the search only varies what the rank gate TRUSTS. PRECISION genes are
+# replay-faithful (perturbative around the anchor stream); GEOMETRY genes (outer lr / momentum /
+# transform) are off-policy and only searched when --include-geometry (rank gate trusted them).
+# When geometry is untrusted, ALL outer genes stay pinned to the anchor's (tuned) values — otherwise
+# the search would optimize against replay numbers we just declared untrustworthy.
 def _sample(rng, anchor, include_geometry):
-    beta = float(rng.choice(OUTER_BETA_MENU))
     g = dc_replace(
         anchor,
         delta_bits=int(rng.choice(BITS_MENU)),
@@ -69,16 +73,20 @@ def _sample(rng, anchor, include_geometry):
         error_feedback=bool(rng.random() < 0.5),
         ef_beta=float(rng.choice(EF_BETA_MENU)),
         stochastic_rounding=bool(rng.random() < 0.5),
-        outer_lr=float(rng.choice(OUTER_LR_MENU)),
-        outer=TemporalGenome(momentum_betas=(beta,), nesterov=bool(rng.random() < 0.5)),
     )
     if include_geometry:
-        g = dc_replace(g, outer_transform=str(rng.choice(OUTER_TRANSFORM_MENU)))
+        g = dc_replace(
+            g,
+            outer_lr=float(rng.choice(OUTER_LR_MENU)),
+            outer=TemporalGenome(momentum_betas=(float(rng.choice(OUTER_BETA_MENU)),),
+                                 nesterov=bool(rng.random() < 0.5)),
+            outer_transform=str(rng.choice(OUTER_TRANSFORM_MENU)),
+        )
     return g
 
 
 def _mutate(rng, g, anchor, include_geometry):
-    which = rng.integers(0, 7 + (1 if include_geometry else 0))
+    which = int(rng.integers(0, 5 + (3 if include_geometry else 0)))
     if which == 0:
         return dc_replace(g, delta_bits=int(rng.choice(BITS_MENU)))
     if which == 1:
@@ -89,11 +97,11 @@ def _mutate(rng, g, anchor, include_geometry):
         return dc_replace(g, ef_beta=float(rng.choice(EF_BETA_MENU)))
     if which == 4:
         return dc_replace(g, stochastic_rounding=not g.stochastic_rounding)
+    # geometry mutations (only reachable when include_geometry)
     if which == 5:
         return dc_replace(g, outer_lr=float(rng.choice(OUTER_LR_MENU)))
     if which == 6:
-        beta = float(rng.choice(OUTER_BETA_MENU))
-        return dc_replace(g, outer=TemporalGenome(momentum_betas=(beta,),
+        return dc_replace(g, outer=TemporalGenome(momentum_betas=(float(rng.choice(OUTER_BETA_MENU)),),
                                                   nesterov=bool(rng.random() < 0.5)))
     return dc_replace(g, outer_transform=str(rng.choice(OUTER_TRANSFORM_MENU)))
 
